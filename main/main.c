@@ -14,29 +14,32 @@
 
 #include "lora.h"
 
-void check_signal_quality() 
+void check_signal_quality()
 {
-    int rssi = lora_packet_rssi();
-    int snr = lora_packet_snr();
-    if (rssi < -120) {
-        ESP_LOGE("Lora", "RSSI: %d dBm, SNR: %d dB", rssi, snr);
-    }else{
-        ESP_LOGI( "Lora", "RSSI: %d dBm, SNR: %d dB", rssi, snr);
-    }
+	int rssi = lora_packet_rssi();
+	int snr = lora_packet_snr();
+	if (rssi < -120)
+	{
+		ESP_LOGE("Lora", "RSSI: %d dBm, SNR: %d dB", rssi, snr);
+	}
+	else
+	{
+		ESP_LOGI("Lora", "RSSI: %d dBm, SNR: %d dB", rssi, snr);
+	}
 }
 
 #if CONFIG_PRIMARY
 
 #define TIMEOUT 100
 
-
 void task_primary(void *pvParameters)
 {
 	ESP_LOGI(pcTaskGetName(NULL), "Start");
 	uint8_t buf[256]; // Maximum Payload size of SX1276/77/78/79 is 255
-	while(1) {
+	while (1)
+	{
 		TickType_t nowTick = xTaskGetTickCount();
-		int send_len = sprintf((char *)buf,"Hello World!! %"PRIu32, nowTick);
+		int send_len = sprintf((char *)buf, "Hello World!! %" PRIu32, nowTick);
 
 #if 0
 		// Maximum Payload size of SX1276/77/78/79 is 255
@@ -49,21 +52,24 @@ void task_primary(void *pvParameters)
 
 		bool waiting = true;
 		TickType_t startTick = xTaskGetTickCount();
-		while(waiting) {
+		while (waiting)
+		{
 			lora_receive(); // put into receive mode
-			if(lora_received()) {
-        check_signal_quality();
-		    int rxLen = lora_receive_packet(buf, sizeof(buf));
+			if (lora_received())
+			{
+				check_signal_quality();
+				int rxLen = lora_receive_packet(buf, sizeof(buf));
 				TickType_t currentTick = xTaskGetTickCount();
 				TickType_t diffTick = currentTick - startTick;
 				ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s]", rxLen, rxLen, buf);
-				ESP_LOGI(pcTaskGetName(NULL), "Response time is %"PRIu32" millisecond", diffTick * portTICK_PERIOD_MS);
+				ESP_LOGI(pcTaskGetName(NULL), "Response time is %" PRIu32 " millisecond", diffTick * portTICK_PERIOD_MS);
 				waiting = false;
 			}
 			TickType_t currentTick = xTaskGetTickCount();
 			TickType_t diffTick = currentTick - startTick;
-			ESP_LOGD(pcTaskGetName(NULL), "diffTick=%"PRIu32, diffTick);
-			if (diffTick > TIMEOUT) {
+			ESP_LOGD(pcTaskGetName(NULL), "diffTick=%" PRIu32, diffTick);
+			if (diffTick > TIMEOUT)
+			{
 				ESP_LOGW(pcTaskGetName(NULL), "Response timeout");
 				waiting = false;
 			}
@@ -79,16 +85,22 @@ void task_secondary(void *pvParameters)
 {
 	ESP_LOGI(pcTaskGetName(NULL), "Start");
 	uint8_t buf[256]; // Maximum Payload size of SX1276/77/78/79 is 255
-	while(1) {
+	while (1)
+	{
 		lora_receive(); // put into receive mode
-		if(lora_received()) {
-      check_signal_quality();
+		if (lora_received())
+		{
+			check_signal_quality();
 			int rxLen = lora_receive_packet(buf, sizeof(buf));
 			ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s]", rxLen, rxLen, buf);
-			for (int i=0;i<rxLen;i++) {
-				if (isupper(buf[i])) {
+			for (int i = 0; i < rxLen; i++)
+			{
+				if (isupper(buf[i]))
+				{
 					buf[i] = tolower(buf[i]);
-				} else {
+				}
+				else
+				{
 					buf[i] = toupper(buf[i]);
 				}
 			}
@@ -103,9 +115,11 @@ void task_secondary(void *pvParameters)
 
 void app_main()
 {
-	if (lora_init() == 0) {
+	if (lora_init() == 0)
+	{
 		ESP_LOGE(pcTaskGetName(NULL), "Does not recognize the module");
-		while(1) {
+		while (1)
+		{
 			vTaskDelay(1);
 		}
 	}
@@ -144,7 +158,7 @@ void app_main()
 	// int sf = 10;
 #if CONFIF_EXTENDED
 	cr = CONFIG_CODING_RATE
-	bw = CONFIG_BANDWIDTH;
+		bw = CONFIG_BANDWIDTH;
 	sf = CONFIG_SF_RATE;
 #endif
 
@@ -155,24 +169,24 @@ void app_main()
 #endif
 
 	lora_set_coding_rate(cr);
-	//lora_set_coding_rate(CONFIG_CODING_RATE);
-	//cr = lora_get_coding_rate();
+	// lora_set_coding_rate(CONFIG_CODING_RATE);
+	// cr = lora_get_coding_rate();
 	ESP_LOGI(pcTaskGetName(NULL), "coding_rate=%d", cr);
 
 	lora_set_bandwidth(bw);
-	//lora_set_bandwidth(CONFIG_BANDWIDTH);
-	//int bw = lora_get_bandwidth();
+	// lora_set_bandwidth(CONFIG_BANDWIDTH);
+	// int bw = lora_get_bandwidth();
 	ESP_LOGI(pcTaskGetName(NULL), "bandwidth=%d", bw);
 
 	lora_set_spreading_factor(sf);
-	//lora_set_spreading_factor(CONFIG_SF_RATE);
-	//int sf = lora_get_spreading_factor();
+	// lora_set_spreading_factor(CONFIG_SF_RATE);
+	// int sf = lora_get_spreading_factor();
 	ESP_LOGI(pcTaskGetName(NULL), "spreading_factor=%d", sf);
 
 #if CONFIG_PRIMARY
-	xTaskCreate(&task_primary, "PRIMARY", 1024*3, NULL, 5, NULL);
+	xTaskCreate(&task_primary, "PRIMARY", 1024 * 3, NULL, 5, NULL);
 #endif
 #if CONFIG_SECONDARY
-	xTaskCreate(&task_secondary, "SECONDARY", 1024*3, NULL, 5, NULL);
+	xTaskCreate(&task_secondary, "SECONDARY", 1024 * 3, NULL, 5, NULL);
 #endif
 }

@@ -5,7 +5,7 @@ void lora_reset(void);
 void lora_explicit_header_mode(void);
 void lora_implicit_header_mode(int size);
 void lora_idle(void);
-void lora_sleep(void); 
+void lora_sleep(void);
 void lora_receive(void);
 int lora_get_irq(void);
 void lora_set_tx_power(int level);
