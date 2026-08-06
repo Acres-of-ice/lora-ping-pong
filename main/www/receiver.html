@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LoRa Receiver</title>
+<style>
+  :root {
+    --page:#0f1420; --surface:#1a2233; --border:#2a3346;
+    --ink:#e7ecf5; --muted:#9aa7bd; --grid:#2a3346;
+    --series-1:#3987e5;             /* voltage */
+    --series-2:#d95926;             /* RSSI */
+    --good:#0ca30c; --warning:#fab219; --critical:#d03b3b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; padding:16px; background:var(--page); color:var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  h1 { font-size:1.25rem; margin:0 0 4px; }
+  h2 { font-size:1rem; margin:0; }
+  h3 { font-size:.8rem; margin:0 0 10px; color:var(--muted);
+       text-transform:uppercase; letter-spacing:.04em; font-weight:600; }
+  .sub { color:var(--muted); font-size:.85rem; margin-bottom:16px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+         background:var(--good); margin-right:6px; vertical-align:middle; }
+  .dot.stale { background:var(--warning); }
+
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:14px 16px; }
+  .card .label { color:var(--muted); font-size:.72rem; text-transform:uppercase; letter-spacing:.04em; }
+  .card .value { font-size:1.5rem; font-weight:650; margin-top:4px; }
+  .card .value small { font-size:.85rem; color:var(--muted); font-weight:400; }
+  .card.hero .value { font-size:2.4rem; }
+  .card .note { color:var(--muted); font-size:.72rem; margin-top:2px; }
+
+  .panel { background:var(--surface); border:1px solid var(--border); border-radius:12px;
+           padding:14px 16px; margin-top:16px; }
+  .row { display:flex; align-items:center; justify-content:space-between;
+         gap:10px; margin-bottom:10px; flex-wrap:wrap; }
+  .fields { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px; }
+  label.f { display:block; color:var(--muted); font-size:.72rem;
+            text-transform:uppercase; letter-spacing:.04em; margin-bottom:4px; }
+  input, select {
+    width:100%; background:var(--page); color:var(--ink); border:1px solid #35507d;
+    border-radius:6px; padding:6px 8px; font-size:.9rem; font-variant-numeric:tabular-nums;
+  }
+  button, a.btn {
+    background:#22314d; color:var(--ink); border:1px solid #35507d; border-radius:8px;
+    padding:7px 12px; font-size:.85rem; cursor:pointer; text-decoration:none; display:inline-block;
+  }
+  button:hover, a.btn:hover { background:#2b3f63; }
+  .danger { background:#3a1a1a; border-color:#7a2b2b; }
+  .danger:hover { background:#4a2020; }
+  .derived { color:var(--muted); font-size:.8rem; margin-top:10px; line-height:1.6; }
+  .derived b { color:var(--ink); font-weight:600; font-variant-numeric:tabular-nums; }
+  .warn { color:var(--warning); } .bad { color:var(--critical); } .ok { color:var(--good); }
+
+  canvas { width:100%; height:300px; display:block; touch-action:none; }
+  .tablewrap { overflow-x:auto; max-height:400px; overflow-y:auto; margin-top:10px; }
+  table { border-collapse:collapse; width:100%; font-size:.82rem; font-variant-numeric:tabular-nums; }
+  th, td { text-align:right; padding:5px 8px; border-bottom:1px solid var(--border); white-space:nowrap; }
+  th { position:sticky; top:0; background:var(--surface); color:var(--muted);
+       font-weight:500; text-transform:uppercase; font-size:.7rem; letter-spacing:.04em; }
+  td.l, th.l { text-align:left; }
+  footer { color:var(--muted); font-size:.75rem; margin-top:14px; }
+  .banner { border-radius:8px; padding:8px 12px; margin-bottom:12px; font-size:.85rem; }
+  .banner.provisional { background:#3a2e14; border:1px solid var(--warning); color:#f4d79a; }
+  .swatch { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:5px;
+            vertical-align:middle; }
+</style>
+</head>
+<body>
+  <h1>LoRa Receiver</h1>
+  <div class="sub">
+    <span id="conn" class="dot"></span><span id="connText">connecting…</span>
+    · <span id="ssid">–</span> · <span id="ip">–</span>
+    · mode <b id="modeLabel">–</b> · last packet <b id="sinceLast">–</b>
+  </div>
+
+  <div id="rollbackBanner" class="banner provisional" hidden></div>
+
+  <h3>Signal</h3>
+  <div class="cards">
+    <div class="card hero">
+      <div class="label">Signal RSSI</div>
+      <div class="value"><span id="sigRssi">–</span> <small>dBm</small></div>
+      <div class="note">after despreading</div>
+    </div>
+    <div class="card">
+      <div class="label">SNR</div>
+      <div class="value"><span id="snr">–</span> <small>dB</small></div>
+      <div class="note">margin <span id="snrMargin">–</span> dB above floor</div>
+    </div>
+  </div>
+
+  <h3 style="margin-top:18px">Delivery</h3>
+  <div class="cards">
+    <div class="card hero">
+      <div class="label">Delivery ratio</div>
+      <div class="value"><span id="pdr">–</span> <small>%</small></div>
+      <div class="note"><span id="rxCount">–</span> received</div>
+    </div>
+    <div class="card">
+      <div class="label">Lost</div>
+      <div class="value" id="lost">–</div>
+      <div class="note">inferred from sequence gaps</div>
+    </div>
+    <div class="card">
+      <div class="label">CRC errors</div>
+      <div class="value" id="crcErr">–</div>
+      <div class="note">decoded but corrupt</div>
+    </div>
+    <div class="card">
+      <div class="label">Header errors</div>
+      <div class="value" id="hdrErr">–</div>
+      <div class="note">preamble found, header bad</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <h2>RSSI over the last packets</h2>
+      <div><button id="resetBtn">Reset counters</button></div>
+    </div>
+    <canvas id="rssiChart"></canvas>
+    <footer id="rssiInfo">No packets yet.</footer>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <h2>Radio profile</h2>
+      <div><button id="applyLocal">Apply</button></div>
+    </div>
+    <div class="fields">
+      <div><label class="f" for="sf">Spreading factor</label><select id="sf"></select></div>
+      <div><label class="f" for="bw">Bandwidth (Hz)</label><select id="bw"></select></div>
+      <div><label class="f" for="cr">Coding rate</label><select id="cr"></select></div>
+      <div><label class="f" for="pre">Preamble (symbols)</label><input id="pre" type="number" min="6" max="65535"></div>
+      <div><label class="f" for="pwr">TX power (dBm)</label><input id="pwr" type="number" min="-9" max="22"></div>
+      <div><label class="f" for="freq">Frequency (Hz)</label><input id="freq" type="number" min="150000000" max="960000000" step="1000"></div>
+    </div>
+    <div class="derived" id="calc"></div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <h2>Battery test</h2>
+      <div>
+        <a class="btn" href="/data.csv">Download CSV</a>
+        <button id="clearLogs" class="danger">Clear log</button>
+      </div>
+    </div>
+    <div class="cards" style="margin-bottom:14px">
+      <div class="card">
+        <div class="label">Sense pin</div>
+        <div class="value"><span id="pinMv">–</span> <small>mV</small></div>
+        <div class="note">as measured, no divider</div>
+      </div>
+      <div class="card">
+        <div class="label">Sender uptime</div>
+        <div class="value" id="battUptime" style="font-size:1.25rem">–</div>
+        <div class="note">discharge clock</div>
+      </div>
+    </div>
+    <canvas id="vChart"></canvas>
+    <footer id="chartInfo">No data yet.</footer>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <h2>Packet log</h2>
+      <div><button id="clearView">Clear view</button></div>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr>
+          <th class="l">Seq</th><th class="l">Type</th><th>Bytes</th><th>RSSI</th>
+          <th>SNR</th><th>Signal RSSI</th><th>Missed before</th>
+        </tr></thead>
+        <tbody id="logBody"></tbody>
+      </table>
+    </div>
+    <footer id="logInfo">No packets yet.</footer>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <h2>Device</h2>
+      <div><button id="rebootBtn" class="danger">Reboot</button></div>
+    </div>
+  </div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const MAX_ROWS = 200;
+const CSS = getComputedStyle(document.documentElement);
+const C = n => CSS.getPropertyValue(n).trim();
+
+function fmtUptime(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const p = n => String(n).padStart(2, "0");
+  return (d > 0 ? d + "d " : "") + p(h) + ":" + p(m) + ":" + p(s);
+}
+function airtimeMs(sf, bwHz, cr, preamble, crc, len) {
+  const tsym = Math.pow(2, sf) * 1000 / bwHz;
+  const de = tsym > 16 ? 1 : 0;
+  const nPre = preamble + (sf < 7 ? 6.25 : 4.25);
+  const den = (sf < 7) ? (4 * sf) : (4 * (sf - 2 * de));
+  const num = 8 * len - 4 * sf + 28 + 16 * (crc ? 1 : 0);
+  return (nPre + 8 + Math.max(Math.ceil(num / den), 0) * cr) * tsym;
+}
+function sensitivityDbm(sf, bwHz) { return -174 + 10 * Math.log10(bwHz) + 6 + (-2.5 * (sf - 4)); }
+function setConn(ok) {
+  $("conn").classList.toggle("stale", !ok);
+  $("connText").textContent = ok ? "online" : "offline — retrying";
+}
+
+const BW_LIST = [7810, 10420, 15630, 20830, 31250, 41670, 62500, 125000, 250000, 500000];
+(function fillSelects() {
+  for (let sf = 5; sf <= 12; sf++) $("sf").add(new Option("SF" + sf, sf));
+  for (const hz of BW_LIST) {
+    $("bw").add(new Option(hz >= 1000 ? (hz / 1000).toFixed(2).replace(/\.?0+$/, "") + " kHz" : hz + " Hz", hz));
+  }
+  for (let cr = 5; cr <= 8; cr++) $("cr").add(new Option("4/" + cr, cr));
+})();
+
+/* ---- radio form ---- */
+let touched = false;
+["sf", "bw", "cr", "pre", "pwr", "freq"].forEach(id =>
+  $(id).addEventListener("input", () => { touched = true; recalc(); }));
+
+function recalc() {
+  const sf = +$("sf").value, bw = +$("bw").value, cr = +$("cr").value;
+  const pre = +$("pre").value, pwr = +$("pwr").value;
+  if (!sf || !bw) return;
+  const sens = sensitivityDbm(sf, bw);
+  $("calc").innerHTML =
+    `Airtime for 255 B <b>${airtimeMs(sf, bw, cr, pre, true, 255).toFixed(0)} ms</b> · ` +
+    `sensitivity <b>${sens.toFixed(1)} dBm</b> · ` +
+    `SNR floor <b>${(-2.5 * (sf - 4)).toFixed(1)} dB</b> · ` +
+    `link budget at ${pwr} dBm <b>${(pwr - sens).toFixed(1)} dB</b>`;
+}
+
+function loadForm(d) {
+  if (touched) return;
+  $("sf").value = d.sf; $("bw").value = d.bw_hz; $("cr").value = d.cr;
+  $("pre").value = d.preamble; $("pwr").value = d.tx_dbm; $("freq").value = d.freq_hz;
+  recalc();
+}
+
+$("applyLocal").onclick = async () => {
+  if (!confirm("Apply this profile?\n\nThe sender must already be using it, or the link " +
+               "stays down until you change the sender to match.")) return;
+  const q = `sf=${+$("sf").value}&bw=${+$("bw").value}&cr=${+$("cr").value}` +
+            `&pre=${+$("pre").value}&pwr=${+$("pwr").value}&freq=${+$("freq").value}`;
+  const r = await fetch("/radio?" + q, { cache: "no-store" });
+  if (!r.ok) { alert("Rejected: " + await r.text()); return; }
+  touched = false; pollStatus();
+};
+
+$("resetBtn").onclick = async () => {
+  await fetch("/reset", { cache: "no-store" });
+  rows = []; cursor = 0; renderLog(); renderRssi(); pollStatus();
+};
+$("clearView").onclick = () => { rows = []; renderLog(); renderRssi(); };
+$("rebootBtn").onclick = () => {
+  if (!confirm("Reboot the receiver?")) return;
+  fetch("/reboot?confirm=1", { cache: "no-store" });
+};
+$("clearLogs").onclick = async () => {
+  if (!confirm("Clear the entire battery log? This cannot be undone.")) return;
+  const r = await fetch("/clear?confirm=1", { cache: "no-store" });
+  if (!r.ok) { alert("Failed to clear the log."); return; }
+  vData = []; lastPlotted = -1; renderV();
+};
+
+/* ---- status ---- */
+async function pollStatus() {
+  let d;
+  try { d = await (await fetch("/status", { cache: "no-store" })).json(); }
+  catch (e) { setConn(false); return; }
+  setConn(true);
+
+  $("ssid").textContent = d.ssid;
+  $("ip").textContent = d.ip;
+  $("modeLabel").textContent = d.mode;
+  $("sinceLast").textContent = d.have_packet ? d.since_last_s + "s ago" : "none yet";
+
+  const n = (v, dp) => (v === 0 && !d.have_packet) ? "–" : v.toFixed(dp);
+  $("sigRssi").textContent = n(d.signal_rssi, 0);
+  $("snr").textContent = n(d.snr, 1);
+  $("snrMargin").textContent = n(d.snr_margin, 1);
+
+  $("pdr").textContent = d.pdr.toFixed(1);
+  $("rxCount").textContent = d.rx;
+  $("lost").textContent = d.lost;
+  $("crcErr").textContent = d.crc_err;
+  $("hdrErr").textContent = d.hdr_err;
+
+  if (d.have_batt) {
+    $("pinMv").textContent = d.pin_mv;
+    $("battUptime").textContent = fmtUptime(d.batt_uptime_s);
+    if (d.batt_uptime_s > lastPlotted) loadChart();
+  }
+
+  loadForm(d);
+
+  const banner = $("rollbackBanner");
+  if (d.rollback_pending) {
+    banner.hidden = false;
+    banner.textContent =
+      `New profile is provisional — reverting in ${d.rollback_s}s unless a packet gets through.`;
+  } else {
+    banner.hidden = true;
+  }
+
+  loadLog();
+}
+
+/* ---- packet log + RSSI chart ---- */
+let rows = [], cursor = 0;
+
+async function loadLog() {
+  let d;
+  try { d = await (await fetch("/log?since=" + cursor, { cache: "no-store" })).json(); }
+  catch (e) { return; }
+  if (!d.entries.length && cursor === d.next) return;
+  cursor = d.next;
+  rows = rows.concat(d.entries).slice(-MAX_ROWS);
+  renderLog();
+  renderRssi();
+}
+
+const TYPE_NAME = { 1: "ping", 2: "ack", 3: "battery", 4: "config", 5: "config ack" };
+
+function renderLog() {
+  const body = $("logBody");
+  if (!rows.length) {
+    body.innerHTML = "";
+    $("logInfo").textContent = "No packets yet.";
+    return;
+  }
+  body.innerHTML = rows.slice().reverse().map(e => `
+    <tr>
+      <td class="l">${e.seq}</td>
+      <td class="l">${TYPE_NAME[e.type] || e.type}</td>
+      <td>${e.len}</td>
+      <td>${e.rssi.toFixed(0)}</td>
+      <td>${e.snr.toFixed(1)}</td>
+      <td>${e.signal_rssi.toFixed(0)}</td>
+      <td>${e.gap || "–"}</td>
+    </tr>`).join("");
+  const missed = rows.reduce((a, e) => a + e.gap, 0);
+  $("logInfo").textContent =
+    `${rows.length} packets in view · ${missed} missed between them`;
+}
+
+/* ---- charts ----
+   Two single-series charts rather than one with two y-axes: volts and dBm do not
+   share a scale, and overlaying them would misrepresent both. */
+function makeChart(canvasId, infoId, opts) {
+  const canvas = $(canvasId);
+  let ctx, dpr = 1, cssW = 0, cssH = 0, plot = null, hoverIdx = -1, data = [];
+
+  function setup() {
+    dpr = window.devicePixelRatio || 1;
+    cssW = canvas.clientWidth; cssH = canvas.clientHeight;
+    canvas.width = Math.round(cssW * dpr); canvas.height = Math.round(cssH * dpr);
+    ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);   // draw in CSS pixels
+  }
+  function niceStep(range, target) {
+    const raw = range / target, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const n = raw / mag;
+    return (n < 1.5 ? 1 : n < 3 ? 2 : n < 7 ? 5 : 10) * mag;
+  }
+  function roundRect(c, x, y, w, h, r) {
+    c.beginPath(); c.moveTo(x + r, y);
+    c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r);
+    c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath();
+  }
+
+  function render() {
+    if (!ctx) setup();
+    ctx.clearRect(0, 0, cssW, cssH);
+    if (data.length === 0) {
+      plot = null;
+      ctx.fillStyle = C("--muted"); ctx.font = "14px system-ui, sans-serif";
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(opts.empty, cssW / 2, cssH / 2);
+      return;
+    }
+
+    let xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity;
+    for (const d of data) {
+      if (d.x < xmin) xmin = d.x; if (d.x > xmax) xmax = d.x;
+      if (d.y < ymin) ymin = d.y; if (d.y > ymax) ymax = d.y;
+    }
+    if (xmax === xmin) xmax = xmin + 1;
+    if (ymax === ymin) { ymin -= 1; ymax += 1; }
+    const pad = (ymax - ymin) * 0.08; ymin -= pad; ymax += pad;
+
+    const padL = 54, padR = 16, padT = 14, padB = 40;
+    const plotW = cssW - padL - padR, plotH = cssH - padT - padB;
+    const sx = x => padL + (x - xmin) / (xmax - xmin) * plotW;
+    const sy = y => padT + (1 - (y - ymin) / (ymax - ymin)) * plotH;
+
+    ctx.font = "11px system-ui, sans-serif"; ctx.lineWidth = 1;
+
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    const yStep = niceStep(ymax - ymin, 5);
+    for (let v = Math.ceil(ymin / yStep) * yStep; v <= ymax; v += yStep) {
+      const y = sy(v);
+      ctx.strokeStyle = C("--grid");
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(cssW - padR, y); ctx.stroke();
+      ctx.fillStyle = C("--muted"); ctx.fillText(opts.fmtY(v), padL - 6, y);
+    }
+
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    const xStep = niceStep(xmax - xmin, 6);
+    for (let v = Math.ceil(xmin / xStep) * xStep; v <= xmax; v += xStep) {
+      const x = sx(v);
+      ctx.strokeStyle = C("--grid");
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, cssH - padB); ctx.stroke();
+      ctx.fillStyle = C("--muted"); ctx.fillText(opts.fmtX(v), x, cssH - padB + 6);
+    }
+
+    ctx.fillStyle = C("--muted"); ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+    ctx.fillText(opts.xLabel, padL + plotW / 2, cssH);
+    ctx.save();
+    ctx.translate(12, padT + plotH / 2); ctx.rotate(-Math.PI / 2);
+    ctx.textBaseline = "top"; ctx.fillText(opts.yLabel, 0, 0);
+    ctx.restore();
+
+    const pts = data.map(d => ({ px: sx(d.x), py: sy(d.y), d }));
+    plot = { pts, padT, padB };
+
+    ctx.strokeStyle = C(opts.color); ctx.lineWidth = 2; ctx.beginPath();
+    pts.forEach((p, i) => (i ? ctx.lineTo(p.px, p.py) : ctx.moveTo(p.px, p.py)));
+    ctx.stroke();
+
+    if (hoverIdx >= 0 && hoverIdx < pts.length) {
+      const p = pts[hoverIdx];
+      ctx.strokeStyle = "rgba(255,255,255,.25)"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(p.px, padT); ctx.lineTo(p.px, cssH - padB); ctx.stroke();
+      // 2px surface ring so the marker reads over the line it sits on.
+      ctx.fillStyle = C("--ink"); ctx.strokeStyle = C("--surface"); ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(p.px, p.py, 5, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+
+      const lines = opts.tooltip(p.d);
+      ctx.font = "12px system-ui, sans-serif"; ctx.textAlign = "left"; ctx.textBaseline = "top";
+      const tw = Math.max(...lines.map(l => ctx.measureText(l).width)) + 16;
+      const th = 8 + lines.length * 14 + 6;
+      let bx = p.px + 12, by = p.py - th - 8;
+      if (bx + tw > cssW - 4) bx = p.px - tw - 12;
+      if (bx < 4) bx = 4;
+      if (by < padT) by = p.py + 12;
+      ctx.fillStyle = "rgba(15,20,32,.96)"; ctx.strokeStyle = "#35507d"; ctx.lineWidth = 1;
+      roundRect(ctx, bx, by, tw, th, 6); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = C("--ink");
+      lines.forEach((l, i) => ctx.fillText(l, bx + 8, by + 6 + i * 14));
+    } else {
+      const last = pts[pts.length - 1];
+      ctx.fillStyle = C(opts.color);
+      ctx.beginPath(); ctx.arc(last.px, last.py, 3.5, 0, 2 * Math.PI); ctx.fill();
+    }
+
+    $(infoId).textContent = opts.info(data);
+  }
+
+  function hoverAt(x, y) {
+    if (!plot) return;
+    if (y < plot.padT - 12 || y > cssH - plot.padB + 12) {
+      if (hoverIdx !== -1) { hoverIdx = -1; render(); }
+      return;
+    }
+    let best = -1, bestd = Infinity;
+    for (let i = 0; i < plot.pts.length; i++) {
+      const dx = Math.abs(plot.pts[i].px - x);
+      if (dx < bestd) { bestd = dx; best = i; }
+    }
+    if (best !== hoverIdx) { hoverIdx = best; render(); }
+  }
+  // Pointer events cover mouse, trackpad, touch and pen alike.
+  const move = e => {
+    const r = canvas.getBoundingClientRect();
+    hoverAt(e.clientX - r.left, e.clientY - r.top);
+  };
+  canvas.addEventListener("pointermove", move);
+  canvas.addEventListener("pointerdown", move);
+  canvas.addEventListener("pointerleave", () => { if (hoverIdx !== -1) { hoverIdx = -1; render(); } });
+  window.addEventListener("resize", () => { setup(); render(); });
+
+  setup();
+  return {
+    set(d) { data = d; if (hoverIdx >= d.length) hoverIdx = -1; render(); },
+    render,
+  };
+}
+
+const rssiChart = makeChart("rssiChart", "rssiInfo", {
+  color: "--series-2",
+  xLabel: "packet sequence", yLabel: "RSSI (dBm)",
+  empty: "No packets yet.",
+  fmtX: v => String(Math.round(v)),
+  fmtY: v => v.toFixed(0),
+  tooltip: d => ["seq  " + d.seq, "RSSI  " + d.y.toFixed(0) + " dBm", "SNR  " + d.snr.toFixed(1) + " dB"],
+  info: d => `${d.length} packets · latest ${d[d.length - 1].y.toFixed(0)} dBm`,
+});
+
+const vChart = makeChart("vChart", "chartInfo", {
+  color: "--series-1",
+  xLabel: "sender uptime", yLabel: "sense pin (mV)",
+  empty: "No data yet — points appear as the sender reports battery telemetry.",
+  fmtX: v => v >= 7200 ? (v / 3600).toFixed(1) + "h" : Math.round(v / 60) + "m",
+  fmtY: v => v.toFixed(0),
+  tooltip: d => ["uptime  " + fmtUptime(d.x), "pin  " + d.y.toFixed(0) + " mV",
+                 "RSSI  " + d.rssi.toFixed(0) + " dBm"],
+  info: d => `${d.length} points · latest ${d[d.length - 1].y.toFixed(0)} mV at ${fmtUptime(d[d.length - 1].x)}`,
+});
+
+function renderRssi() {
+  rssiChart.set(rows.map(e => ({ x: e.seq, y: e.rssi, seq: e.seq, snr: e.snr })));
+}
+
+/* ---- battery CSV ---- */
+let vData = [], lastPlotted = -1, loadingCsv = false;
+
+async function loadChart() {
+  if (loadingCsv) return;
+  loadingCsv = true;
+  try {
+    const text = await (await fetch("/data.csv", { cache: "no-store" })).text();
+    const out = [];
+    for (const line of text.split("\n")) {
+      const c = line.split(",");
+      if (c.length < 2) continue;
+      const t = parseFloat(c[0]), v = parseFloat(c[1]);
+      if (!Number.isFinite(t) || !Number.isFinite(v)) continue;
+      out.push({ x: t, y: v, rssi: parseFloat(c[2]) || 0 });
+    }
+    vData = out;
+    lastPlotted = out.length ? out[out.length - 1].x : -1;
+    vChart.set(out);
+  } catch (e) {
+    $("chartInfo").textContent = "Failed to load the log.";
+  } finally {
+    loadingCsv = false;
+  }
+}
+
+pollStatus();
+loadChart();
+setInterval(pollStatus, 1000);
+</script>
+</body>
+</html>

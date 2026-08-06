@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LoRa Sender</title>
+<style>
+  :root {
+    --page:#0f1420; --surface:#1a2233; --border:#2a3346;
+    --ink:#e7ecf5; --muted:#9aa7bd; --grid:#2a3346;
+    --series-1:#3987e5;             /* voltage */
+    --good:#0ca30c; --warning:#fab219; --critical:#d03b3b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; padding:16px; background:var(--page); color:var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  h1 { font-size:1.25rem; margin:0 0 4px; }
+  h2 { font-size:1rem; margin:0; }
+  .sub { color:var(--muted); font-size:.85rem; margin-bottom:16px; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+         background:var(--good); margin-right:6px; vertical-align:middle; }
+  .dot.stale { background:var(--warning); }
+
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:14px 16px; }
+  .card .label { color:var(--muted); font-size:.72rem; text-transform:uppercase; letter-spacing:.04em; }
+  .card .value { font-size:1.5rem; font-weight:650; margin-top:4px; }
+  .card .value small { font-size:.85rem; color:var(--muted); font-weight:400; }
+  .card.hero .value { font-size:2.4rem; }
+  .card .note { color:var(--muted); font-size:.72rem; margin-top:2px; }
+
+  .panel { background:var(--surface); border:1px solid var(--border); border-radius:12px;
+           padding:14px 16px; margin-top:16px; }
+  .row { display:flex; align-items:center; justify-content:space-between;
+         gap:10px; margin-bottom:10px; flex-wrap:wrap; }
+  .fields { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px; }
+  label.f { display:block; color:var(--muted); font-size:.72rem;
+            text-transform:uppercase; letter-spacing:.04em; margin-bottom:4px; }
+  input, select {
+    width:100%; background:var(--page); color:var(--ink); border:1px solid #35507d;
+    border-radius:6px; padding:6px 8px; font-size:.9rem; font-variant-numeric:tabular-nums;
+  }
+  button, a.btn {
+    background:#22314d; color:var(--ink); border:1px solid #35507d; border-radius:8px;
+    padding:7px 12px; font-size:.85rem; cursor:pointer; text-decoration:none; display:inline-block;
+  }
+  button:hover, a.btn:hover { background:#2b3f63; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .danger { background:#3a1a1a; border-color:#7a2b2b; }
+  .danger:hover { background:#4a2020; }
+  button.on { background:#7a1f1f; border-color:#b83232; }
+  .derived { color:var(--muted); font-size:.8rem; margin-top:10px; line-height:1.6; }
+  .derived b { color:var(--ink); font-weight:600; font-variant-numeric:tabular-nums; }
+  .warn { color:var(--warning); }
+  .bad  { color:var(--critical); }
+  .ok   { color:var(--good); }
+
+  .tablewrap { overflow-x:auto; max-height:420px; overflow-y:auto; margin-top:10px; }
+  table { border-collapse:collapse; width:100%; font-size:.82rem; font-variant-numeric:tabular-nums; }
+  th, td { text-align:right; padding:5px 8px; border-bottom:1px solid var(--border); white-space:nowrap; }
+  th { position:sticky; top:0; background:var(--surface); color:var(--muted);
+       font-weight:500; text-transform:uppercase; font-size:.7rem; letter-spacing:.04em; }
+  td.l, th.l { text-align:left; }
+  .pill { padding:1px 6px; border-radius:4px; font-size:.72rem; font-weight:600; }
+  .pill.ack  { color:var(--good); border:1px solid var(--good); }
+  .pill.miss { color:var(--critical); border:1px solid var(--critical); }
+  footer { color:var(--muted); font-size:.75rem; margin-top:14px; }
+  .banner { border-radius:8px; padding:8px 12px; margin-bottom:12px; font-size:.85rem; }
+  .banner.provisional { background:#3a2e14; border:1px solid var(--warning); color:#f4d79a; }
+</style>
+</head>
+<body>
+  <h1>LoRa Sender</h1>
+  <div class="sub">
+    <span id="conn" class="dot"></span><span id="connText">connecting…</span>
+    · <span id="ssid">–</span> · <span id="ip">–</span>
+    · mode <b id="modeLabel">–</b>
+  </div>
+
+  <div id="rollbackBanner" class="banner provisional" hidden></div>
+
+  <div class="cards">
+    <div class="card hero">
+      <div class="label">Acknowledged</div>
+      <div class="value" id="ackCount">–</div>
+      <div class="note"><span id="ackRate">–</span>% of <span id="txCount">–</span> sent</div>
+    </div>
+    <div class="card">
+      <div class="label">Missed</div>
+      <div class="value" id="missCount">–</div>
+      <div class="note">no acknowledgement</div>
+    </div>
+    <div class="card">
+      <div class="label">Round trip</div>
+      <div class="value"><span id="rtt">–</span> <small>ms</small></div>
+      <div class="note">last exchange</div>
+    </div>
+    <div class="card">
+      <div class="label">Airtime</div>
+      <div class="value"><span id="airtime">–</span> <small>ms</small></div>
+      <div class="note">duty <span id="duty">–</span>%</div>
+    </div>
+    <div class="card">
+      <div class="label">Sense pin</div>
+      <div class="value"><span id="pinMv">–</span> <small>mV</small></div>
+      <div class="note">as measured, no divider</div>
+    </div>
+    <div class="card">
+      <div class="label">Discharge uptime</div>
+      <div class="value" id="uptime" style="font-size:1.25rem">–</div>
+      <div class="note">survives a brownout</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <h2>Test control</h2>
+      <div>
+        <button id="runBtn">Start</button>
+        <button id="modeBtn">Switch to battery test</button>
+        <button id="resetBtn">Reset counters</button>
+      </div>
+    </div>
+    <div class="fields">
+      <div>
+        <label class="f" for="interval">Interval (ms, 0 = back-to-back)</label>
+        <input id="interval" type="number" min="0" max="600000" step="100">
+      </div>
+      <div>
+        <label class="f" for="size">Payload (bytes)</label>
+        <input id="size" type="number" min="14" max="255">
+      </div>
+      <div style="align-self:end">
+        <button id="saveCtl">Save</button>
+      </div>
+    </div>
+    <div class="derived" id="controlNote"></div>
+    <div class="derived" id="saveNote"></div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <h2>Radio profile</h2>
+      <div>
+        <button id="applyLocal">Apply here only</button>
+        <button id="pushBtn">Push to receiver</button>
+      </div>
+    </div>
+    <div class="fields">
+      <div>
+        <label class="f" for="sf">Spreading factor</label>
+        <select id="sf"></select>
+      </div>
+      <div>
+        <label class="f" for="bw">Bandwidth (Hz)</label>
+        <select id="bw"></select>
+      </div>
+      <div>
+        <label class="f" for="cr">Coding rate</label>
+        <select id="cr"></select>
+      </div>
+      <div>
+        <label class="f" for="pre">Preamble (symbols)</label>
+        <input id="pre" type="number" min="6" max="65535">
+      </div>
+      <div>
+        <label class="f" for="pwr">TX power (dBm)</label>
+        <input id="pwr" type="number" min="-9" max="22">
+      </div>
+      <div>
+        <label class="f" for="freq">Frequency (Hz)</label>
+        <input id="freq" type="number" min="150000000" max="960000000" step="1000">
+      </div>
+    </div>
+    <div class="derived" id="calc"></div>
+    <div class="derived" id="pushState"></div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <h2>Battery test</h2>
+      <div>
+        <button id="drainBtn">Start max drain</button>
+        <button id="wifiOff" class="danger">Turn WiFi off</button>
+      </div>
+    </div>
+    <div class="fields">
+      <div style="align-self:end">
+        <button id="uptimeReset" class="danger">Reset discharge clock</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <h2>Packet log</h2>
+      <div><button id="clearLog">Clear view</button></div>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr>
+          <th class="l">Seq</th><th>Bytes</th><th class="l">Result</th><th>RTT ms</th>
+          <th>Airtime ms</th><th>RX RSSI</th><th>RX SNR</th><th>ACK RSSI</th><th>ACK SNR</th>
+        </tr></thead>
+        <tbody id="logBody"></tbody>
+      </table>
+    </div>
+    <footer id="logInfo">No packets yet.</footer>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <h2>Device</h2>
+      <div><button id="rebootBtn" class="danger">Reboot</button></div>
+    </div>
+  </div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const MAX_ROWS = 200;
+
+/* ---- shared helpers ---- */
+function fmtUptime(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const p = n => String(n).padStart(2, "0");
+  return (d > 0 ? d + "d " : "") + p(h) + ":" + p(m) + ":" + p(s);
+}
+
+// Mirrors sx126x_airtime_ms() so the form reacts before anything is committed.
+// If this ever disagrees with the /radio response, one of the two is wrong.
+function airtimeMs(sf, bwHz, cr, preamble, crc, len) {
+  const tsym = Math.pow(2, sf) * 1000 / bwHz;
+  const de = tsym > 16 ? 1 : 0;
+  const nPre = preamble + (sf < 7 ? 6.25 : 4.25);
+  const den = (sf < 7) ? (4 * sf) : (4 * (sf - 2 * de));
+  const num = 8 * len - 4 * sf + 28 + 16 * (crc ? 1 : 0);
+  const blocks = Math.max(Math.ceil(num / den), 0);
+  return (nPre + 8 + blocks * cr) * tsym;
+}
+function sensitivityDbm(sf, bwHz) {
+  return -174 + 10 * Math.log10(bwHz) + 6 + (-2.5 * (sf - 4));
+}
+
+const BW_LIST = [7810, 10420, 15630, 20830, 31250, 41670, 62500, 125000, 250000, 500000];
+function fillSelects() {
+  for (let sf = 5; sf <= 12; sf++) $("sf").add(new Option("SF" + sf, sf));
+  for (const hz of BW_LIST) {
+    $("bw").add(new Option(hz >= 1000 ? (hz / 1000).toFixed(2).replace(/\.?0+$/, "") + " kHz" : hz + " Hz", hz));
+  }
+  for (let cr = 5; cr <= 8; cr++) $("cr").add(new Option("4/" + cr, cr));
+}
+
+function setConn(ok) {
+  $("conn").classList.toggle("stale", !ok);
+  $("connText").textContent = ok ? "online" : "offline — retrying";
+}
+
+/* ---- radio form ---- */
+let touched = false;                      // don't clobber a form being edited
+const FORM = ["sf", "bw", "cr", "pre", "pwr", "freq"];
+FORM.forEach(id => $(id).addEventListener("input", () => { touched = true; recalc(); }));
+
+function formCfg() {
+  return {
+    sf: +$("sf").value, bw: +$("bw").value, cr: +$("cr").value,
+    pre: +$("pre").value, pwr: +$("pwr").value, freq: +$("freq").value,
+  };
+}
+
+function recalc() {
+  const c = formCfg();
+  const len = Math.max(16, Math.min(255, +$("size").value || 255));
+  // Not `+value || 5000`: zero is a valid interval and would fall through as falsy.
+  const ivRaw = $("interval").value.trim();
+  const interval = ivRaw === "" ? 5000 : Math.max(0, Math.min(600000, +ivRaw));
+  if (!c.sf || !c.bw) return;
+
+  const toa = airtimeMs(c.sf, c.bw, c.cr, c.pre, true, len);
+  const ackToa = airtimeMs(c.sf, c.bw, c.cr, c.pre, true, 13);
+  const round = toa + ackToa;
+  const cycle = Math.max(interval, round);
+  const duty = 100 * toa / cycle;
+  const bitrate = len * 8 * 1000 / toa;
+
+  // Flag the case that actually bites in the field: an exchange longer than the
+  // interval you asked for. At interval 0 that is the intent, not a surprise.
+  const over = interval > 0 && round > interval;
+  $("calc").innerHTML =
+    `Airtime <b>${toa.toFixed(0)} ms</b> · acknowledgement <b>${ackToa.toFixed(0)} ms</b> · ` +
+    `round trip <b class="${over ? "warn" : ""}">${(round / 1000).toFixed(2)} s</b> · ` +
+    `duty cycle <b>${duty.toFixed(1)}%</b> · throughput <b>${bitrate.toFixed(0)} bit/s</b> · ` +
+    `sensitivity <b>${sensitivityDbm(c.sf, c.bw).toFixed(1)} dBm</b> · ` +
+    `link budget <b>${(c.pwr - sensitivityDbm(c.sf, c.bw)).toFixed(1)} dB</b>` +
+    (interval === 0
+      ? `<br><span class="warn">Back-to-back: next packet goes out as soon as the ` +
+        `acknowledgement lands, keeping the PA keyed ~${duty.toFixed(0)}% of the time. ` +
+        `Maximum drain — check your local duty-cycle rules before running this on air.</span>`
+      : over
+        ? `<br><span class="warn">A round trip takes longer than the ${interval} ms interval — ` +
+          `packets will run back-to-back.</span>`
+        : "");
+}
+["size", "interval"].forEach(id => $(id).addEventListener("input", recalc));
+
+function loadForm(d) {
+  if (touched) return;
+  $("sf").value = d.sf;
+  $("bw").value = d.bw_hz;
+  $("cr").value = d.cr;
+  $("pre").value = d.preamble;
+  $("pwr").value = d.tx_dbm;
+  $("freq").value = d.freq_hz;
+  recalc();
+}
+
+function cfgQuery() {
+  const c = formCfg();
+  return `sf=${c.sf}&bw=${c.bw}&cr=${c.cr}&pre=${c.pre}&pwr=${c.pwr}&freq=${c.freq}`;
+}
+
+async function applyLocal() {
+  if (!confirm("Apply here only?\n\nThis changes the sender and nothing else, so the link " +
+               "stays down until you change the receiver to match. \"Push to receiver\" " +
+               "changes both — use this only to recover an already-broken link.")) return;
+  const r = await fetch("/radio?" + cfgQuery(), { cache: "no-store" });
+  if (!r.ok) { alert("Rejected: " + await r.text()); return; }
+  touched = false;
+  pollStatus();
+}
+
+async function pushCfg() {
+  const r = await fetch("/pushcfg?confirm=1&" + cfgQuery(), { cache: "no-store" });
+  if (!r.ok) { alert("Rejected: " + await r.text()); return; }
+  touched = false;
+  $("pushState").textContent = "Push queued…";
+}
+
+/* ---- controls ---- */
+let running = false, loadOn = false, mode = "range";
+
+async function post(url) {
+  try { return await (await fetch(url, { cache: "no-store" })).json(); }
+  catch (e) { return null; }
+}
+
+$("runBtn").onclick = () => post("/control?run=" + (running ? 0 : 1)).then(pollStatus);
+$("resetBtn").onclick = () => post("/control?reset=1").then(() => { rows = []; cursor = 0; renderLog(); pollStatus(); });
+$("modeBtn").onclick = () => post("/mode?m=" + (mode === "battery" ? "range" : "battery")).then(pollStatus);
+$("drainBtn").onclick = () => post("/load?on=" + (loadOn ? 0 : 1)).then(pollStatus);
+$("applyLocal").onclick = applyLocal;
+$("pushBtn").onclick = pushCfg;
+$("clearLog").onclick = () => { rows = []; renderLog(); };
+
+// Both values are persisted on the device, so this survives a reset - which matters
+// for a battery run that is expected to brown out partway through.
+async function saveControl() {
+  const iv = +$("interval").value, sz = +$("size").value;
+  const r = await fetch(`/control?interval_ms=${iv}&size=${sz}`, { cache: "no-store" });
+  if (!r.ok) {
+    $("saveNote").innerHTML = `<span class="bad">Rejected: ${await r.text()}</span>`;
+    return;
+  }
+  $("saveNote").innerHTML = `<span class="ok">Saved — interval ${iv} ms, payload ${sz} B.` +
+                            ` Restored automatically after a reset.</span>`;
+  setTimeout(() => { $("saveNote").textContent = ""; }, 6000);
+  pollStatus();
+}
+$("saveCtl").onclick = saveControl;
+// Committing on blur too, so tabbing out of a field is not silently discarded.
+$("interval").addEventListener("change", saveControl);
+$("size").addEventListener("change", saveControl);
+
+$("uptimeReset").onclick = () => {
+  if (!confirm("Reset the discharge clock to zero? The receiver's graph will restart.")) return;
+  post("/uptime?reset=1").then(pollStatus);
+};
+$("rebootBtn").onclick = () => {
+  if (!confirm("Reboot the sender?")) return;
+  fetch("/reboot?confirm=1", { cache: "no-store" });
+};
+$("wifiOff").onclick = () => {
+  if (!confirm("Turn WiFi off?\n\nThis dashboard becomes unreachable until you reset the board. " +
+               "LoRa keeps transmitting and the receiver keeps logging.")) return;
+  post("/wifi?on=0");
+};
+
+/* ---- status polling ---- */
+let baseUptime = 0, baseAt = performance.now(), synced = false;
+function tickUptime() {
+  if (synced) $("uptime").textContent = fmtUptime(baseUptime + (performance.now() - baseAt) / 1000);
+}
+
+async function pollStatus() {
+  let d;
+  try { d = await (await fetch("/status", { cache: "no-store" })).json(); }
+  catch (e) { setConn(false); return; }
+  setConn(true);
+
+  $("ssid").textContent = d.ssid;
+  $("ip").textContent = d.ip;
+  $("modeLabel").textContent = d.mode;
+  mode = d.mode;
+
+  $("ackCount").textContent = d.ack;
+  $("ackRate").textContent = d.ack_rate.toFixed(1);
+  $("txCount").textContent = d.tx;
+  $("missCount").textContent = d.timeout;
+  $("rtt").textContent = d.last_rtt_ms || "–";
+  $("airtime").textContent = d.airtime_ms.toFixed(0);
+  $("duty").textContent = (d.duty_cycle * 100).toFixed(1);
+  $("pinMv").textContent = d.pin_mv;
+
+  baseUptime = d.uptime_s; baseAt = performance.now(); synced = true; tickUptime();
+
+  running = d.running;
+  $("runBtn").textContent = running ? "Stop" : "Start";
+  $("runBtn").classList.toggle("on", running);
+
+  loadOn = d.load;
+  const arming = d.load_arming_s || 0;
+  $("drainBtn").textContent = !loadOn ? "Start max drain"
+                            : arming > 0 ? `Starting in ${arming}s…`
+                            : "Stop max drain";
+  $("drainBtn").classList.toggle("on", loadOn && arming === 0);
+
+  $("modeBtn").textContent = mode === "battery" ? "Switch to range test" : "Switch to battery test";
+
+  if (document.activeElement !== $("interval")) $("interval").value = d.interval_ms;
+  if (document.activeElement !== $("size")) $("size").value = d.payload_len;
+  loadForm(d);
+
+  // Disable rather than let a second click collect a 400 "already in flight".
+  // A push can take a while: it retries three times, and at a high spreading
+  // factor each attempt is seconds of airtime.
+  $("pushBtn").disabled = d.push_busy;
+  $("pushBtn").textContent = d.push_busy ? "Pushing…" : "Push to receiver";
+  $("pushState").textContent = d.push_state === "idle" ? "" : "Config push: " + d.push_state;
+
+  const banner = $("rollbackBanner");
+  if (d.rollback_pending) {
+    banner.hidden = false;
+    banner.textContent =
+      `New profile is provisional — reverting in ${d.rollback_s}s unless a packet gets through.`;
+  } else {
+    banner.hidden = true;
+  }
+
+  $("controlNote").innerHTML = running
+    ? (d.interval_ms === 0
+        ? `Sending <b>back-to-back</b>, next sequence <b>${d.next_seq}</b>.`
+        : `Sending every <b>${d.interval_ms} ms</b>, next sequence <b>${d.next_seq}</b>.`)
+    : `Stopped.`;
+
+  loadLog();
+}
+
+/* ---- packet log ---- */
+let rows = [], cursor = 0;
+
+async function loadLog() {
+  let d;
+  try { d = await (await fetch("/log?since=" + cursor, { cache: "no-store" })).json(); }
+  catch (e) { return; }
+  if (!d.entries.length && cursor === d.next) return;
+  cursor = d.next;
+  rows = rows.concat(d.entries).slice(-MAX_ROWS);
+  renderLog();
+}
+
+function renderLog() {
+  const body = $("logBody");
+  if (!rows.length) {
+    body.innerHTML = "";
+    $("logInfo").textContent = "No packets yet.";
+    return;
+  }
+  // Newest first: while walking away you care about the last few packets.
+  const html = rows.slice().reverse().map(e => `
+    <tr>
+      <td class="l">${e.seq}</td>
+      <td>${e.len}</td>
+      <td class="l"><span class="pill ${e.acked ? "ack" : "miss"}">${e.acked ? "ACK" : "MISSED"}</span></td>
+      <td>${e.acked ? e.rtt_ms : "–"}</td>
+      <td>${e.airtime_ms.toFixed(0)}</td>
+      <td>${e.acked ? e.ack_rssi.toFixed(0) : "–"}</td>
+      <td>${e.acked ? e.ack_snr.toFixed(1) : "–"}</td>
+      <td>${e.acked ? e.local_rssi.toFixed(0) : "–"}</td>
+      <td>${e.acked ? e.local_snr.toFixed(1) : "–"}</td>
+    </tr>`).join("");
+  body.innerHTML = html;
+
+  const acked = rows.filter(e => e.acked).length;
+  $("logInfo").textContent =
+    `${rows.length} packets in view · ${acked} acknowledged (${(100 * acked / rows.length).toFixed(0)}%)`;
+}
+
+fillSelects();
+pollStatus();
+setInterval(pollStatus, 1000);
+setInterval(tickUptime, 1000);
+</script>
+</body>
+</html>

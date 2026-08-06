@@ -1,192 +1,105 @@
-/* The example of ESP-IDF
- *
- * This sample code is in the public domain.
- */
+// LoRa range-test and battery-test rig.
+//
+// One firmware, two roles selected in menuconfig. The sender transmits numbered
+// packets (or battery telemetry) and shows what came back; the receiver reports
+// link quality and logs the battery run to CSV. Each has its own dashboard.
 
-#include <stdio.h>
-#include <inttypes.h>
-#include <string.h>
-#include <ctype.h>
-
+#include "esp_log.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_log.h"
+#include "nvs_flash.h"
+#include "sdkconfig.h"
 
-#include "lora.h"
+#include "link.h"
+#include "net.h"
+#include "sx126x.h"
+#include "webserver.h"
 
-void check_signal_quality()
+#if CONFIG_ROLE_SENDER
+#include "battery.h"
+#include "powerload.h"
+#include "sender.h"
+#else
+#include "receiver.h"
+#include "storage.h"
+#endif
+
+static const char *TAG = "main";
+
+// Spelled out rather than printed as a bare number: under max drain the whole
+// point is telling a brownout apart from a crash, and guessing at the enum
+// ordering is how you misread that.
+static const char *reset_reason_str(esp_reset_reason_t r)
 {
-	int rssi = lora_packet_rssi();
-	int snr = lora_packet_snr();
-	if (rssi < -120)
-	{
-		ESP_LOGE("Lora", "RSSI: %d dBm, SNR: %d dB", rssi, snr);
-	}
-	else
-	{
-		ESP_LOGI("Lora", "RSSI: %d dBm, SNR: %d dB", rssi, snr);
-	}
+    switch (r) {
+        case ESP_RST_POWERON:   return "power-on";
+        case ESP_RST_EXT:       return "external pin";
+        case ESP_RST_SW:        return "software restart";
+        case ESP_RST_PANIC:     return "PANIC / exception";
+        case ESP_RST_INT_WDT:   return "interrupt watchdog";
+        case ESP_RST_TASK_WDT:  return "task watchdog";
+        case ESP_RST_WDT:       return "other watchdog";
+        case ESP_RST_DEEPSLEEP: return "deep sleep wake";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT - supply sagged";
+        case ESP_RST_SDIO:      return "SDIO";
+        case ESP_RST_USB:       return "USB peripheral (flash/monitor)";
+        case ESP_RST_JTAG:      return "JTAG";
+        default:                return "unknown";
+    }
 }
 
-#if CONFIG_PRIMARY
-
-#define TIMEOUT 100
-
-void task_primary(void *pvParameters)
+void app_main(void)
 {
-	ESP_LOGI(pcTaskGetName(NULL), "Start");
-	uint8_t buf[256]; // Maximum Payload size of SX1276/77/78/79 is 255
-	while (1)
-	{
-		TickType_t nowTick = xTaskGetTickCount();
-		int send_len = sprintf((char *)buf, "Hello World!! %" PRIu32, nowTick);
+#if CONFIG_ROLE_SENDER
+    ESP_LOGI(TAG, "LoRa test rig starting - role: SENDER");
+#else
+    ESP_LOGI(TAG, "LoRa test rig starting - role: RECEIVER");
+#endif
+    const esp_reset_reason_t reason = esp_reset_reason();
+    ESP_LOGW(TAG, "Reset reason: %s (%d)", reset_reason_str(reason), (int)reason);
 
-#if 0
-		// Maximum Payload size of SX1276/77/78/79 is 255
-		memset(&buf[send_len], 0x20, 255-send_len);
-		send_len = 255;
+    esp_err_t nvs = nvs_flash_init();
+    if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    }
+
+    // Radio first: a wiring fault should surface before WiFi fills the log.
+    esp_err_t err = sx126x_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SX1262 init failed (%s).", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Check NSS/SCK/MOSI/MISO/RST/BUSY wiring and 3V3 to the module.");
+        while (1) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+    ESP_ERROR_CHECK(link_init());
+
+#if CONFIG_ROLE_SENDER
+    ESP_ERROR_CHECK(battery_init());
+#else
+    ESP_ERROR_CHECK(storage_init());
 #endif
 
-		lora_send_packet(buf, send_len);
-		ESP_LOGI(pcTaskGetName(NULL), "%d byte packet sent:[%.*s]", send_len, send_len, buf);
+    if (net_start() != ESP_OK) {
+        ESP_LOGW(TAG, "No network; the radio still runs but the dashboard is unavailable");
+    }
 
-		bool waiting = true;
-		TickType_t startTick = xTaskGetTickCount();
-		while (waiting)
-		{
-			lora_receive(); // put into receive mode
-			if (lora_received())
-			{
-				check_signal_quality();
-				int rxLen = lora_receive_packet(buf, sizeof(buf));
-				TickType_t currentTick = xTaskGetTickCount();
-				TickType_t diffTick = currentTick - startTick;
-				ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s]", rxLen, rxLen, buf);
-				ESP_LOGI(pcTaskGetName(NULL), "Response time is %" PRIu32 " millisecond", diffTick * portTICK_PERIOD_MS);
-				waiting = false;
-			}
-			TickType_t currentTick = xTaskGetTickCount();
-			TickType_t diffTick = currentTick - startTick;
-			ESP_LOGD(pcTaskGetName(NULL), "diffTick=%" PRIu32, diffTick);
-			if (diffTick > TIMEOUT)
-			{
-				ESP_LOGW(pcTaskGetName(NULL), "Response timeout");
-				waiting = false;
-			}
-			vTaskDelay(1); // Avoid WatchDog alerts
-		} // end waiting
-		vTaskDelay(pdMS_TO_TICKS(5000));
-	} // end while
-}
-#endif // CONFIG_PRIMARY
+// #if CONFIG_ROLE_SENDER
+//     // Not fatal: without WiFi there is no max-drain load, but the LoRa side works.
+//     powerload_init();
+// #endif
 
-#if CONFIG_SECONDARY
-void task_secondary(void *pvParameters)
-{
-	ESP_LOGI(pcTaskGetName(NULL), "Start");
-	uint8_t buf[256]; // Maximum Payload size of SX1276/77/78/79 is 255
-	while (1)
-	{
-		lora_receive(); // put into receive mode
-		if (lora_received())
-		{
-			check_signal_quality();
-			int rxLen = lora_receive_packet(buf, sizeof(buf));
-			ESP_LOGI(pcTaskGetName(NULL), "%d byte packet received:[%.*s]", rxLen, rxLen, buf);
-			for (int i = 0; i < rxLen; i++)
-			{
-				if (isupper(buf[i]))
-				{
-					buf[i] = tolower(buf[i]);
-				}
-				else
-				{
-					buf[i] = toupper(buf[i]);
-				}
-			}
-			vTaskDelay(1);
-			lora_send_packet(buf, rxLen);
-			ESP_LOGI(pcTaskGetName(NULL), "%d byte packet sent back...", rxLen);
-		}
-		vTaskDelay(1); // Avoid WatchDog alerts
-	}
-}
-#endif // CONFIG_SECONDARY
+    if (net_wifi_is_on()) {
+        webserver_start();
+    }
 
-void app_main()
-{
-	if (lora_init() == 0)
-	{
-		ESP_LOGE(pcTaskGetName(NULL), "Does not recognize the module");
-		while (1)
-		{
-			vTaskDelay(1);
-		}
-	}
-
-#if CONFIG_169MHZ
-	ESP_LOGI(pcTaskGetName(NULL), "Frequency is 169MHz");
-	lora_set_frequency(169e6); // 169MHz
-#elif CONFIG_433MHZ
-	ESP_LOGI(pcTaskGetName(NULL), "Frequency is 433MHz");
-	lora_set_frequency(433e6); // 433MHz
-#elif CONFIG_470MHZ
-	ESP_LOGI(pcTaskGetName(NULL), "Frequency is 470MHz");
-	lora_set_frequency(470e6); // 470MHz
-#elif CONFIG_866MHZ
-	ESP_LOGI(pcTaskGetName(NULL), "Frequency is 866MHz");
-	lora_set_frequency(866e6); // 866MHz
-#elif CONFIG_915MHZ
-	ESP_LOGI(pcTaskGetName(NULL), "Frequency is 915MHz");
-	lora_set_frequency(915e6); // 915MHz
-#elif CONFIG_OTHER
-	ESP_LOGI(pcTaskGetName(NULL), "Frequency is %dMHz", CONFIG_OTHER_FREQUENCY);
-	long frequency = CONFIG_OTHER_FREQUENCY * 1000000;
-	lora_set_frequency(frequency);
+#if CONFIG_ROLE_SENDER
+    ESP_ERROR_CHECK(sender_start());
+#else
+    ESP_ERROR_CHECK(receiver_start());
 #endif
 
-	lora_enable_crc();
-
-	// int cr = 1;
-	// int bw = 7;
-	// int sf = 7;
-	int cr = 4;
-	int bw = 2;
-	int sf = 10;
-	// int cr = 3;
-	// int bw = 7;
-	// int sf = 10;
-#if CONFIF_EXTENDED
-	cr = CONFIG_CODING_RATE
-		bw = CONFIG_BANDWIDTH;
-	sf = CONFIG_SF_RATE;
-#endif
-
-#if CONFIG_ADVANCED
-	cr = CONFIG_CODING_RATE;
-	bw = CONFIG_BANDWIDTH;
-	sf = CONFIG_SF_RATE;
-#endif
-
-	lora_set_coding_rate(cr);
-	// lora_set_coding_rate(CONFIG_CODING_RATE);
-	// cr = lora_get_coding_rate();
-	ESP_LOGI(pcTaskGetName(NULL), "coding_rate=%d", cr);
-
-	lora_set_bandwidth(bw);
-	// lora_set_bandwidth(CONFIG_BANDWIDTH);
-	// int bw = lora_get_bandwidth();
-	ESP_LOGI(pcTaskGetName(NULL), "bandwidth=%d", bw);
-
-	lora_set_spreading_factor(sf);
-	// lora_set_spreading_factor(CONFIG_SF_RATE);
-	// int sf = lora_get_spreading_factor();
-	ESP_LOGI(pcTaskGetName(NULL), "spreading_factor=%d", sf);
-
-#if CONFIG_PRIMARY
-	xTaskCreate(&task_primary, "PRIMARY", 1024 * 3, NULL, 5, NULL);
-#endif
-#if CONFIG_SECONDARY
-	xTaskCreate(&task_secondary, "SECONDARY", 1024 * 3, NULL, 5, NULL);
-#endif
+    ESP_LOGI(TAG, "Ready - dashboard at http://%s/", net_ip_str());
 }

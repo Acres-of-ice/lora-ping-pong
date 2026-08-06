@@ -1,0 +1,8 @@
+# Partition table for the LoRa test rig (4MB flash).
+# The "storage" partition holds the receiver's SPIFFS battery CSV log. The sender
+# builds with the same table and simply never mounts it.
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+factory,    app,  factory, 0x10000,  0x200000,
+storage,    data, spiffs,  ,         0x100000,

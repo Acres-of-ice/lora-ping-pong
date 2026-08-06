@@ -1,5 +1,10 @@
 .cache/
 build/
+build.sender/
+build.receiver/
 sdkconfig
+sdkconfig.sender
+sdkconfig.receiver
 sdkconfig.old
+sdkconfig.*.old
 dependencies.lock

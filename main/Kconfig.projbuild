@@ -1,87 +1,210 @@
-menu "Application Configuration"
+menu "LoRa Test Rig"
 
-	choice POLARITY
-		prompt "Communication Polarity"
-		default PRIMARY
+	choice ROLE
+		prompt "Device role"
+		default ROLE_SENDER
 		help
-			Select Communication Polarity.
-		config PRIMARY
-			bool "Primary"
+			Both roles ship in one firmware; flash the same build twice with this
+			set differently. Keeping them in one project stops the packet format
+			and radio tables drifting apart.
+		config ROLE_SENDER
+			bool "Sender"
 			help
-				As Echo Client.
-		config SECONDARY
-			bool "Secondary"
+				Transmits numbered packets and waits for acknowledgements. Owns
+				the battery sense ADC and the max-drain WiFi load.
+		config ROLE_RECEIVER
+			bool "Receiver"
 			help
-				As Echo Server.
+				Listens, acknowledges, reports link quality, and logs the battery
+				telemetry it receives to a CSV on SPIFFS.
 	endchoice
 
-	choice FREQUENCY
-		prompt "Frequency to use"
-		default 433MHZ
-		help
-			Select Frequency to use.
-		config 169MHZ
-			bool "169MHz"
-			help
-				Frequency is 169MHz.
-		config 433MHZ
-			bool "433MHz"
-			help
-				Frequency is 433MHz.
-		config 470MHZ
-			bool "470MHz"
-			help
-				Frequency is 470MHz.
-		config 866MHZ
-			bool "866MHz"
-			help
-				Frequency is 866MHz.
-		config 915MHZ
-			bool "915MHz"
-			help
-				Frequency is 915MHz.
-		config OTHER
-			bool "Other"
-			help
-				Other Frequency.
-	endchoice
+	menu "Radio defaults"
+		comment "Starting values only - the dashboard overrides these and saves to NVS"
 
-	config OTHER_FREQUENCY
-		depends on OTHER
-		int "Frequency to use[MHz]"
-		range 1 999
-		default 433
-		help
-			Frequency to use[MHz].
+		config LINK_FREQ_KHZ
+			int "Carrier frequency (kHz)"
+			range 150000 960000
+			default 866000
+			help
+				866000 sits in the 865-867 MHz Indian ISM band. The SX1262 covers
+				150-960 MHz, but the module's matching network and antenna do not:
+				stay in the band the hardware was built for.
 
-	config ADVANCED
-		bool "Enable Advanced settings"
-		default false
-		help
-			Enable Advanced settings.
+		config LINK_DEFAULT_SF
+			int "Spreading factor"
+			range 5 12
+			default 7
 
-	config CODING_RATE
-		depends on ADVANCED
-		int "Error coding rate"
-		range 1 4
-		default 1
-		help
-			Error coding rate.
+		config LINK_DEFAULT_CR
+			int "Coding rate denominator (4/x)"
+			range 5 8
+			default 5
 
-	config BANDWIDTH
-		depends on ADVANCED
-		int "Signal Bandwidth"
-		range 0 9
-		default 7
-		help
-			Signal Bandwidth.
+		config LINK_DEFAULT_PREAMBLE
+			int "Preamble length (symbols)"
+			range 6 65535
+			default 8
 
-	config SF_RATE
-		depends on ADVANCED
-		int "Spreading Factor"
-		range 5 12
-		default 7
-		help
-			Spreading Factor.
+		config LINK_DEFAULT_TX_DBM
+			int "Transmit power (dBm)"
+			range -9 22
+			default 22
+			help
+				+22 dBm is the SX1262 maximum. Check this is legal for your band
+				and antenna gain before running it outdoors.
+	endmenu
 
-endmenu 
+	menu "Sender"
+		config SENDER_DEFAULT_INTERVAL_MS
+			int "Interval between packets (ms)"
+			range 0 600000
+			default 5000
+			help
+				Measured from the start of one exchange to the next. At high
+				spreading factors a single exchange can exceed this, in which case
+				the sender simply runs back-to-back.
+
+				0 means back-to-back deliberately: transmit again the moment the
+				acknowledgement arrives. That is the setting for a maximum-drain
+				battery test, since it keeps the PA keyed for most of the wall
+				clock. Check your local duty-cycle rules before running it on air.
+
+		config SENDER_DEFAULT_PAYLOAD
+			int "Payload size (bytes)"
+			range 16 255
+			default 255
+			help
+				255 is the LoRa maximum and the honest worst case for a range test.
+				Be aware what it costs: at SF12/BW125 one packet is ~9.0 s in the
+				air. The 13-byte acknowledgement adds ~1.2 s, so a full exchange is
+				~10.2 s. The dashboard shows both live so you can trade it off.
+	endmenu
+
+	menu "Network"
+		choice NET_MODE
+			prompt "WiFi mode"
+			default NET_MODE_AP
+			help
+				Access point is the field default: there is no router in a
+				car park, and you need the dashboard on a phone while walking.
+			config NET_MODE_AP
+				bool "Access point"
+			config NET_MODE_STA
+				bool "Join an existing network"
+		endchoice
+
+		config NET_AP_SSID_PREFIX
+			string "AP SSID prefix"
+			default "LORA-TEST"
+			help
+				The last two bytes of the MAC are appended, so the two boards are
+				distinguishable on air.
+
+		config NET_AP_PASSWORD
+			string "AP password"
+			default "loratest"
+			help
+				Minimum 8 characters for WPA2. Leave empty for an open network.
+
+		config NET_AP_CHANNEL
+			int "AP channel"
+			range 1 13
+			default 1
+
+		config NET_STA_SSID
+			string "WiFi SSID"
+			default "myssid"
+
+		config NET_STA_PASSWORD
+			string "WiFi password"
+			default "mypassword"
+	endmenu
+
+	menu "Max-drain load (sender)"
+		config POWERLOAD_ARM_DELAY_S
+			int "Boot delay before the load starts (seconds)"
+			range 0 120
+			default 15
+			help
+				The load is on by default and its state is saved, so a load heavy
+				enough to brown the board out would otherwise persist itself into a
+				reset loop with no window to switch it off. This delay guarantees the
+				dashboard is always reachable for at least this long after boot.
+
+				Do not set this to 0 unless you are certain the supply can carry the
+				load, and you have a way to erase NVS if it cannot.
+
+		config POWERLOAD_GAP_PERIOD_MS
+			int "Transmit burst length before a breathing gap (ms)"
+			range 100 10000
+			default 500
+
+		config POWERLOAD_JOIN_GRACE_MS
+			int "Pause on a new station joining (ms)"
+			range 0 15000
+			default 4000
+			help
+				The periodic breathing gap is not synchronised to the moment a client
+				actually needs quiet air, which is right after association while it
+				negotiates DHCP. Starved there, a phone's own connectivity check gives
+				up fast: association followed by a client-initiated leave (reason 3)
+				within a couple hundred ms, rather than the AP-side four-way-handshake
+				timeout (reason 15) the breathing gap already covers.
+
+				This suspends the flood for this long whenever WIFI_EVENT_AP_STACONNECTED
+				fires, giving DHCP and a captive-portal check a clear run. 0 disables it.
+
+		config POWERLOAD_GAP_MS
+			int "Breathing gap length (ms)"
+			range 0 500
+			default 50
+			help
+				The broadcast flood saturates the WiFi transmit path, which starves
+				the WPA2 four-way handshake: a client associates and is then deauthed
+				with reason 15 (4WAY_HANDSHAKE_TIMEOUT) a few seconds later. Since the
+				load is on by default and persisted, that locks you out of the very
+				dashboard you would use to turn it off.
+
+				This pauses the flood briefly and periodically so association and TCP
+				get a clear window. The default 50 ms every 500 ms costs about 10% of
+				the WiFi share of the load - a few mA - and makes the AP joinable.
+
+				0 disables the gaps entirely. Only do that if you do not need the
+				dashboard while the load runs, and remember the boot delay is then
+				your only window in.
+
+		config POWERLOAD_CPU_SPIN
+			bool "Also busy-loop the CPU while the load is on"
+			default y
+			help
+				FreeRTOS's idle task halts the core with `waiti`, which saves power -
+				the opposite of what a worst-case draw test wants. This adds a
+				low-priority spin task to keep the CPU out of that state.
+
+				Worth roughly 10-15 mA on top of the radio load. Turn it off first if
+				the supply cannot quite carry everything, since it buys the least
+				current for the most risk.
+	endmenu
+
+	menu "Battery (sender)"
+		config BATTERY_ADC_CHANNEL
+			int "Battery-sense ADC1 channel"
+			range 0 4
+			default 2
+			help
+				Must be an ADC1 channel: ADC2 is unusable while WiFi is active.
+				With the SX1262 occupying GPIO3 (DIO1) and GPIO4 (RST), channel 2
+				(GPIO2 = A0/D0) is the only one the XIAO ESP32C3 header leaves free.
+
+		config LOG_INTERVAL_S
+			int "Discharge-clock checkpoint interval (seconds)"
+			range 5 3600
+			default 300
+			help
+				How often the sender writes its discharge clock to NVS so the run
+				survives a brownout. Shorter loses less time on a reset but writes
+				to flash more often over a multi-day test.
+	endmenu
+
+endmenu

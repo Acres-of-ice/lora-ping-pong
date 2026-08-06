@@ -1,0 +1,128 @@
+menu "SX1262 Radio"
+
+	config SX126X_GPIO_RANGE_MAX
+		int
+		default 33 if IDF_TARGET_ESP32
+		default 46 if IDF_TARGET_ESP32S2
+		default 48 if IDF_TARGET_ESP32S3
+		default 19 if IDF_TARGET_ESP32C3
+		default 30 if IDF_TARGET_ESP32C6
+		default 48
+
+	comment "Defaults match a Seeed Wio-SX1262 on a XIAO ESP32C3"
+
+	config SX126X_MOSI_GPIO
+		int "MOSI GPIO"
+		range 0 SX126X_GPIO_RANGE_MAX
+		default 10
+		help
+			XIAO ESP32C3 D10.
+
+	config SX126X_MISO_GPIO
+		int "MISO GPIO"
+		range 0 SX126X_GPIO_RANGE_MAX
+		default 9
+		help
+			XIAO ESP32C3 D9. Also a boot strapping pin, but its internal pull-up
+			holds it high while NSS is deasserted, so booting is unaffected.
+
+	config SX126X_SCK_GPIO
+		int "SCK GPIO"
+		range 0 SX126X_GPIO_RANGE_MAX
+		default 8
+		help
+			XIAO ESP32C3 D8.
+
+	config SX126X_NSS_GPIO
+		int "NSS (chip select) GPIO"
+		range 0 SX126X_GPIO_RANGE_MAX
+		default 6
+		help
+			XIAO ESP32C3 D4.
+
+	config SX126X_RST_GPIO
+		int "RST GPIO"
+		range 0 SX126X_GPIO_RANGE_MAX
+		default 4
+		help
+			XIAO ESP32C3 D2.
+
+	config SX126X_BUSY_GPIO
+		int "BUSY GPIO"
+		range 0 SX126X_GPIO_RANGE_MAX
+		default 5
+		help
+			XIAO ESP32C3 D3. The SX126x holds this high while it is processing a
+			command; the driver waits on it before every SPI transaction. If it
+			never drops, the module is miswired or unpowered.
+
+	config SX126X_DIO1_GPIO
+		int "DIO1 (interrupt) GPIO"
+		range 0 SX126X_GPIO_RANGE_MAX
+		default 3
+		help
+			XIAO ESP32C3 D1. Carries TxDone/RxDone/CrcErr/Timeout.
+
+	config SX126X_RFSW_GPIO
+		int "RF switch enable GPIO"
+		range 0 SX126X_GPIO_RANGE_MAX
+		default 7
+		help
+			XIAO ESP32C3 D5. Powers the module's external antenna switch. TX/RX
+			steering itself is done internally by DIO2.
+
+	config SX126X_RFSW_TX_HIGH
+		bool "Drive RF switch high only during transmit"
+		default n
+		help
+			Most Wio-SX1262 revisions want this line held statically high to power
+			the antenna switch (leave this off). A few instead use it as a TX/RX
+			select. Symptom of getting it wrong: transmit works at arm's length
+			and nowhere beyond.
+
+	config SX126X_TCXO
+		bool "Module has a TCXO powered from DIO3"
+		default y
+		help
+			The Seeed Wio-SX1262 (and most SX1262 modules) clock from a TCXO whose
+			supply comes from the radio's DIO3 pin. It must be enabled before the
+			crystal oscillator can start.
+
+			Leave this on unless you know the module uses a bare crystal. Getting
+			it wrong the other way is deceptive rather than obvious: SPI keeps
+			working because register access runs off the RC oscillator, the chip
+			accepts every configuration command, and then transmit and receive
+			silently never happen because both need the XOSC. The driver now
+			checks GetDeviceErrors for XOSC_START_ERR at boot and says so.
+
+	config SX126X_TCXO_VOLTAGE
+		int "TCXO supply voltage selector"
+		range 0 7
+		default 2
+		depends on SX126X_TCXO
+		help
+			0=1.6V 1=1.7V 2=1.8V 3=2.2V 4=2.4V 5=2.7V 6=3.0V 7=3.3V.
+			1.8V (2) is right for the Wio-SX1262. Check the module schematic before
+			raising it - over-volting the TCXO is a hardware fault, not a config one.
+
+	config SX126X_TCXO_DELAY_US
+		int "TCXO startup delay (microseconds)"
+		range 1000 20000
+		default 5000
+		depends on SX126X_TCXO
+		help
+			How long the radio waits for the TCXO to stabilise before declaring the
+			oscillator started. 5 ms is a safe default; too short shows up as an
+			intermittent XOSC_START_ERR.
+
+	choice SX126X_SPI_HOST
+		prompt "SPI peripheral"
+		default SX126X_SPI2_HOST
+		config SX126X_SPI2_HOST
+			bool "SPI2_HOST"
+		config SX126X_SPI3_HOST
+			depends on IDF_TARGET_ESP32 || IDF_TARGET_ESP32S2 || IDF_TARGET_ESP32S3
+			bool "SPI3_HOST"
+	endchoice
+
+endmenu
