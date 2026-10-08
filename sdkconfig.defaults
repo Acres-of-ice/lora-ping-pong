@@ -18,3 +18,11 @@ CONFIG_FREERTOS_HZ=1000
 
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_HTTPD_MAX_URI_LEN=512
+
+# The serial console fetches routes from the board's own web server over loopback
+# (main/console.c). httpd writes every header field separately, and on loopback
+# those arrive as a burst of tiny segments faster than the console task reads
+# them; past 6 the socket's mailbox refuses them and lwIP retries only on its
+# 250 ms timer, so every request took a quarter of a second, and a long one
+# seconds. Pointers only: 32 costs about 100 bytes per open socket.
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32

@@ -7,6 +7,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "led.h"
 #include "nvs.h"
 #include "sdkconfig.h"
 
@@ -219,6 +220,14 @@ esp_err_t link_set_cfg(const sx126x_cfg_t *cfg, bool persist)
 {
     lock();
     s_cfg = *cfg;
+    // A persisted change is an explicit one from /radio, and it ends any provisional
+    // window. Left running, the window reverted the operator's choice after its
+    // silence timeout - and link_persist_cfg(), which saves the fallback while a
+    // profile is provisional, wrote the old profile to NVS instead of this one, so
+    // a reset brought the old one back too.
+    if (persist) {
+        s_prov = false;
+    }
     unlock();
 
     esp_err_t err = sx126x_apply(cfg);
@@ -432,6 +441,7 @@ bool link_profile_tick(void)
                  (unsigned)silence_s);
         sx126x_apply(&revert);
         link_persist_cfg();
+        led_event(LED_EV_REVERT);
         return true;
     }
     if (proven) {
@@ -439,6 +449,7 @@ bool link_profile_tick(void)
         unlock();
         ESP_LOGI(TAG, "Profile carried traffic for %us; committing", (unsigned)commit_s);
         link_persist_cfg();
+        led_event(LED_EV_COMMIT);
         return false;
     }
     unlock();

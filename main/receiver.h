@@ -78,6 +78,7 @@ typedef struct {
     bool     contact_seen;      // heard any frame from the sender since boot
     uint32_t contact_age_s;
     bool     sender_stopped;    // as of the last frame heard from it
+    bool     link_lost;         // contact_seen, and silent for longer than its cadence explains
 
     uint32_t log_seq;
 } receiver_status_t;

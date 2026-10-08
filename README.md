@@ -31,6 +31,7 @@ the sender over LoRa, so the whole rig runs from one phone on `lora-recv`.
 | Solar charger CHRG (CN3791) | — | 5 | open-drain, low while charging |
 | Solar charger DONE (CN3791) | — | 3 | open-drain, low once charged |
 | Battery divider (sender only) | — | 0 (ADC1_CH0) | R12 100k / R13 30k |
+| Status LED (WS2812, U8) DIN | — | 4 | VDD is BAT+, not 3V3 — see *Status LED* |
 
 The Ra-01SH has a plain crystal (no TCXO), runs the SX1262 from its internal LDO
 (no DC-DC inductor), and keeps its antenna switch inside the module, driven by the
@@ -61,6 +62,94 @@ being topped up.
 865–867 MHz band. Anything the SX1262 tunes (150–960 MHz) is accepted, but the
 Ra-01SH's antenna matching is built for 803–930 MHz, so expect far less range
 outside it.
+
+## Status LED
+
+The WS2812 (U8) shows what the board is doing without a phone. Status runs dim — a
+tenth of full by default — and is lit for tens of milliseconds at a time, so the
+indicator costs well under a milliamp on average and does not bend a battery run.
+One task owns the LED and shows the most important thing going on:
+
+| Priority | Pattern | Meaning |
+|---|---|---|
+| 1 | Red, 5 blinks a second | The radio never came up (wiring, or 3V3 at the module) |
+| 2 | **Solid white, full brightness** | Max drain is running (sender) |
+| 3 | White, 2 blinks a second | Max drain is on and starts when the boot delay ends |
+| 4 | Short flashes, one per event | See below |
+| 5 | A blink every few seconds | The background state, see below |
+
+**Max drain is solid white at 255 on purpose.** A WS2812 sinks a constant current per
+die, so all three dies fully on is the most it can draw (roughly 35–60 mA, by part);
+no other colour comes close. It ignores the brightness setting, no packet flash
+interrupts it, and it follows the load exactly: off during the boot delay, off when
+the brownout streak stands the load down, off with WiFi.
+
+Flashes, at the status brightness:
+
+| Flash | Sender | Receiver |
+|---|---|---|
+| Blue, 20 ms | a packet went out | — |
+| Green / yellow-green / amber / orange, 60 ms | acknowledged; colour is the weaker direction's SNR margin, ≥10 / 5–10 / 0–5 / <0 dB | a packet arrived; colour is its SNR margin |
+| Red, 200 ms | no acknowledgement | packets went missing before this one |
+| Red ×2 | the radio refused to transmit | the radio refused to send the ACK |
+| Pink, 30 ms | — | a frame failed CRC / header check |
+| Violet ×2 | carried out a command from the receiver | the sender confirmed a command |
+| Cyan ×3 | a new profile went live (provisional) | accepted a pushed profile |
+| Red then cyan | the provisional profile rolled back | same |
+| Green then cyan | the provisional profile was saved | same |
+
+The margin colours make a walk-test readable at a glance: green is comfortable,
+orange is a link about to drop.
+
+Background, shown only after a full period with nothing else lighting the LED — so a
+link passing packets shows its packets, not a heartbeat on top:
+
+| Background | Sender | Receiver |
+|---|---|---|
+| Red, every 2 s | link down: 3 exchanges in a row unanswered | link down: silent for 3× its observed cadence (at least 20 s) |
+| Violet, every 1 s | — | commands waiting to go to the sender |
+| Cyan ×2, every 2 s | profile still provisional | same |
+| Orange ×3, every 4 s | battery below `CONFIG_LED_LOW_BATT_MV` (3.4 V) — calibrate the divider first, or it fires early | — |
+| Amber, every 3 s | stopped (still checking in) | the sender is stopped |
+| Blue, every 3 s | — | listening; nothing heard since boot |
+| Green blip, every 5 s | idle and healthy | idle and healthy |
+
+Both dashboards have a *Status LED* panel: the pattern showing now, the brightness
+(0–255, saved; 0 turns status off but never hides the fault or max-drain patterns),
+a colour test, and this legend. `/led?test=1` runs red, green, blue and white at full
+brightness for 400 ms each — the quickest check that all three dies work.
+
+**The LED runs off BAT+.** With no cell fitted it stays dark however correct the
+firmware is, and it keeps its last colour through an ESP reset (including max drain's
+white — init writes black first thing). Below about 3.5 V on BAT+ the green and blue
+dies fade first. `/led?trace=1` returns the last 48 colour changes with timestamps,
+which is how the patterns and timings were verified without anyone watching.
+
+## Bench work over USB
+
+Every dashboard route also works over the USB serial port: type `/status` (or any
+route) on the console and the board answers it from its own web server over loopback,
+so it behaves exactly as it does over WiFi. That matters on a laptop whose only
+internet is its WiFi — joining `lora-send`/`lora-recv` would cut it off.
+
+`tools/usb_bridge.py` holds both ports open and serves each real dashboard on
+localhost, over USB:
+
+```sh
+tools/usb_bridge.py serve --sender   /dev/serial/by-id/usb-Espressif_…_3A:24-if00 \
+                          --receiver /dev/serial/by-id/usb-Espressif_…_3A:B8-if00
+# sender   -> http://127.0.0.1:8081/
+# receiver -> http://127.0.0.1:8082/
+tools/usb_bridge.py get receiver /status         # one-off, from another shell
+```
+
+Use the `/dev/serial/by-id/` paths: `ttyACM` numbers shuffle with plug order, and on
+a laptop with a WWAN modem one of them is the modem. Keep the bridge running rather
+than reopening ports — opening an ESP32-C3's USB serial port with the wrong DTR/RTS
+sequence resets the board. `release`/`attach` free a port for flashing meanwhile.
+
+`tools/rig_test.py` is the hardware test campaign built on the bridge (`--list` for
+the tests, `soak --soak-min 30` for a long run). It writes `test-results/<time>/`.
 
 ## Build
 
@@ -110,13 +199,20 @@ main/battery.c         ADC + divider + brownout-surviving discharge clock
 main/storage.c         SPIFFS CSV log (receiver)
 main/powerload.c       max-drain WiFi load (sender, battery test)
 main/webserver.c       HTTP routes
+main/led.c             WS2812 status LED: RMT driver, patterns, priorities
+main/console.c         dashboard routes over the USB serial console
 main/www/              the two dashboards
+tools/usb_bridge.py    both dashboards on localhost over USB
+tools/rig_test.py      hardware test campaign
 ```
 
 ## HTTP endpoints
 
 Both: `/` `/status` `/log?since=N` `/radio[?sf=&bw=&cr=&pre=&pwr=&freq=]`
-`/reboot?confirm=1`
+`/reboot?confirm=1` · `/led[?level=0..255|test=1|trace=1]`
+
+`/status` also reports `boot_s`, `reset_reason` and free / minimum heap, so a long
+run shows a brownout or a leak without a serial cable.
 
 Sender also: `/control?run=&interval_ms=&size=&reset=1` ·
 `/pushcfg?confirm=1&sf=…` · `/mode?m=range|battery` · `/load?on=0|1` ·
@@ -282,6 +378,12 @@ build defaults and bending the discharge curve for a non-battery reason:
 | Sequence number, counters, discharge clock (sender) | `runstate` partition | 1 / 0 / 0 |
 | Delivery statistics, CRC and header error counts (receiver) | `runstate` partition | 0 |
 | Remote-command ids (receiver's next, sender's last) | `runstate` partition | random / none |
+| Status LED brightness | `nvs`: `led` | `CONFIG_LED_LEVEL` (24) |
+
+Because the save happens before each transmit, a reset drops the exchange in flight
+from the sender's tallies — its "sent" and its outcome together, so sent = acked +
+missed still holds — and the discharge clock resumes from the last packet, losing at
+most one interval of on-time. Neither ever steps back past a packet already sent.
 
 **Reset counters** zeroes the counts, and the saved copies with them, but the sequence
 number keeps counting so graphs keyed by it keep moving forward. **Reset discharge
@@ -292,6 +394,8 @@ The mode switch deliberately leaves max drain alone — it is an operator settin
 something a mode change should flip underneath you. A
 provisionally-pushed radio profile is the one exception: it is not written until it
 commits, so a reset during the provisional window returns to the previous profile.
+A local `/radio` change ends a provisional window on that board: it is an explicit
+choice, so it is saved at once and nothing reverts it.
 
 ## Troubleshooting
 

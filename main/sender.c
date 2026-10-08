@@ -9,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "led.h"
 #include "link.h"
 #include "net.h"
 #include "nvs.h"
@@ -51,6 +52,14 @@ static uint32_t s_seq = 1;
 // gaps as lost packets - so a config push used to dent the delivery ratio.
 static uint32_t s_ctrl_seq = 1;
 static uint32_t s_tx_count, s_ack_count, s_timeout_count;
+// Exchanges in a row (polls included) that got no answer. Not a counter of the run:
+// it says whether the link is up right now, so it resets on the first answer.
+static uint32_t s_consec_miss;
+// Bumped by every counter reset. An exchange spanning a reset counts in no tally:
+// its "sent" went with the reset, so its outcome must not land after it - an ack
+// arriving after /control?reset=1 (which runs on the HTTP task, mid-exchange about
+// half the time at short intervals) put the ack count one past the sent count.
+static uint32_t s_reset_epoch;
 static uint32_t s_last_rtt_ms;
 static float    s_last_ack_rssi, s_last_ack_snr;
 static float    s_last_local_rssi, s_last_local_snr;
@@ -237,12 +246,15 @@ static void exchange(link_pkt_type_t type, uint8_t *buf, uint8_t len, sender_log
     e->airtime_ms  = sx126x_airtime_ms(&cfg, len);
     e->at_uptime_s = battery_uptime_s();
 
+    led_event(LED_EV_TX);
     const int64_t t0 = esp_timer_get_time();
     if (sx126x_tx(buf, len, tx_timeout_ms(&cfg, len)) != ESP_OK) {
         lock();
         s_tx_count++;
         s_timeout_count++;
+        s_consec_miss++;
         unlock();
+        led_event(LED_EV_RADIO_ERR);
         // A radio that is failing outright, or being recovered by the driver,
         // fails instantly; at interval 0 the loop would then retry - and log - at
         // the tick rate. The pause comes out of the interval, so it only slows
@@ -252,6 +264,7 @@ static void exchange(link_pkt_type_t type, uint8_t *buf, uint8_t len, sender_log
     }
     lock();
     s_tx_count++;
+    const uint32_t epoch = s_reset_epoch;
     unlock();
 
     // Listen for the acknowledgement.
@@ -283,7 +296,10 @@ static void exchange(link_pkt_type_t type, uint8_t *buf, uint8_t len, sender_log
         e->local_snr  = info.snr;
 
         lock();
-        s_ack_count++;
+        if (epoch == s_reset_epoch) {
+            s_ack_count++;
+        }
+        s_consec_miss     = 0;
         s_last_rtt_ms     = e->rtt_ms;
         s_last_ack_rssi   = e->ack_rssi;
         s_last_ack_snr    = e->ack_snr;
@@ -296,13 +312,20 @@ static void exchange(link_pkt_type_t type, uint8_t *buf, uint8_t len, sender_log
         // both directions.
         link_profile_traffic_ok();
         take_command(rx, n);
+        // Coloured by the weaker direction: a link is only as good as that.
+        const float worst = e->ack_snr < e->local_snr ? e->ack_snr : e->local_snr;
+        led_link_quality(worst - sx126x_snr_floor_db(cfg.sf));
         break;
     }
 
     if (!e->acked) {
         lock();
-        s_timeout_count++;
+        if (epoch == s_reset_epoch) {
+            s_timeout_count++;
+        }
+        s_consec_miss++;
         unlock();
+        led_event(LED_EV_NO_ACK);
     }
     sx126x_standby();
 }
@@ -436,6 +459,7 @@ static void do_cfg_push(void)
 
     link_set_cfg(&want, false);
     link_profile_provisional(&old, silence_s);
+    led_event(LED_EV_PROFILE);
 
     if (confirmed) {
         push_state("applied on both; provisional until traffic passes");
@@ -462,6 +486,10 @@ static void poll_receiver(bool running)
     p->charge  = (uint8_t)charge_state();
     p->running = running;
     if (sx126x_tx(buf, sizeof(buf), tx_timeout_ms(&cfg, sizeof(buf))) != ESP_OK) {
+        lock();
+        s_consec_miss++;
+        unlock();
+        led_event(LED_EV_RADIO_ERR);
         return;
     }
 
@@ -469,6 +497,7 @@ static void poll_receiver(bool running)
     sx126x_rx_start(to);
     uint8_t rx[LINK_MAX_PAYLOAD];
     const int64_t deadline = esp_timer_get_time() + (int64_t)to * 1000;
+    bool answered = false;
     while (esp_timer_get_time() < deadline) {
         const int n = sx126x_rx_wait(rx, sizeof(rx), NULL, 100);
         if (n > 0 && link_check(rx, n, PKT_ACK, sizeof(link_ack_t)) &&
@@ -478,10 +507,16 @@ static void poll_receiver(bool running)
             unlock();
             link_profile_traffic_ok();  // a round trip, as good as a ping's
             take_command(rx, n);
+            answered = true;
             break;
         }
     }
     sx126x_standby();
+    // Unflashed either way - a stopped sender's check-ins are not test traffic - but
+    // they keep the link-down indication honest while there is no other traffic.
+    lock();
+    s_consec_miss = answered ? 0 : s_consec_miss + 1;
+    unlock();
 }
 
 static uint32_t poll_period_ms(void)
@@ -592,6 +627,7 @@ static void run_remote_command(const link_cmd_t *c)
     snprintf(s_remote_state, sizeof(s_remote_state), "%s: %s", what, ok ? "done" : "refused");
     unlock();
     ESP_LOGW(TAG, "Command from the receiver: %s (%s)", what, ok ? "done" : "refused");
+    led_event(LED_EV_COMMAND);
 
     send_cmdack(c->id, s_last_cmd.result);
     if (c->op == LINK_CMD_REBOOT) {
@@ -752,6 +788,7 @@ void sender_get_status(sender_status_t *out)
     out->last_local_snr  = s_last_local_snr;
     out->log_seq       = s_log_seq;
     out->peer_charge   = s_peer_charge;
+    out->consec_miss   = s_consec_miss;
     const uint32_t interval = s_interval_ms;
     const uint8_t  len      = s_payload_len;
     unlock();
@@ -835,6 +872,7 @@ void sender_reset_counters(void)
 {
     lock();
     s_tx_count = s_ack_count = s_timeout_count = 0;
+    s_reset_epoch++;
     s_last_rtt_ms = 0;
     s_last_ack_rssi = s_last_ack_snr = 0.0f;
     s_last_local_rssi = s_last_local_snr = 0.0f;

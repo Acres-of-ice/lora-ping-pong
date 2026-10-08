@@ -8,3 +8,6 @@ sdkconfig.receiver
 sdkconfig.old
 sdkconfig.*.old
 dependencies.lock
+test-results/
+usb_bridge_logs/
+__pycache__/

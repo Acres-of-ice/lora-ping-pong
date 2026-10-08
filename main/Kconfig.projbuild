@@ -204,6 +204,55 @@ menu "LoRa Test Rig"
 				current for the most risk.
 	endmenu
 
+	menu "Status LED"
+		config LED_ENABLE
+			bool "Drive the WS2812 status LED"
+			default y
+			help
+				The Repeater PCB's U8, a WS2812 with its VDD on BAT+. See led.h for
+				what each colour and blink means.
+
+		config LED_GPIO
+			int "LED data GPIO"
+			depends on LED_ENABLE
+			range 0 21
+			default 4
+			help
+				Repeater PCB: IO4 (RGB_GPIO) -> U8 DIN.
+
+		config LED_LEVEL
+			int "Status brightness (0-255, until set from the dashboard)"
+			depends on LED_ENABLE
+			range 0 255
+			default 24
+			help
+				Brightness of the status blinks and packet flashes. The default is
+				about a tenth of full: easily seen indoors at a few mA for tens of
+				milliseconds a flash, so the indicator does not bend a battery run.
+				The dashboard changes it and saves it to NVS.
+
+				Max drain ignores this and runs the LED solid white at 255.
+
+		config LED_LOW_BATT_MV
+			int "Low-battery warning below (mV, sender)"
+			depends on LED_ENABLE
+			range 2500 4200
+			default 3400
+			help
+				The sender blinks orange three times every few seconds while its
+				battery reads below this. 3.4 V leaves a LiPo roughly a tenth of its
+				charge; the WS2812 itself starts to fade below about 3.5 V on VDD.
+	endmenu
+
+	config USB_ROUTES
+		bool "Dashboard routes over the USB serial console"
+		default y
+		help
+			Type a route such as /status on the USB serial port and the board
+			answers it from its own web server. tools/usb_bridge.py uses this to
+			serve both dashboards on a laptop with no WiFi spare to join the
+			boards' access points. See console.h.
+
 	menu "Battery (sender)"
 		config BATTERY_ADC_CHANNEL
 			int "Battery-sense ADC1 channel"

@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "led.h"
 #include "link.h"
 #include "nvs.h"
 #include "runstate.h"
@@ -71,6 +72,14 @@ static int64_t       s_sender_at_us;
 static bool          s_contact_seen;
 static int64_t       s_contact_us;
 static bool          s_sender_stopped;
+
+// The last few gaps between frames from the sender, for judging when silence means
+// the link is down. The receiver is not told the interval (unless the sender has
+// answered a command), so it learns the cadence from what it hears.
+#define CONTACT_GAPS     8
+#define LINK_LOST_MIN_S  20
+static uint32_t s_contact_gap_ms[CONTACT_GAPS];
+static uint8_t  s_contact_gap_i;
 
 static receiver_log_t s_log[RECEIVER_LOG_SIZE];
 static uint32_t       s_log_seq;
@@ -276,7 +285,9 @@ static void send_ack(uint32_t seq, const sx126x_rxinfo_t *info, uint8_t rx_len)
     sx126x_cfg_t cfg;
     link_get_cfg(&cfg);
     const uint32_t to = (uint32_t)(sx126x_airtime_ms(&cfg, len) * 2.0f) + 500;
-    sx126x_tx(buf, len, to);
+    if (sx126x_tx(buf, len, to) != ESP_OK) {
+        led_event(LED_EV_RADIO_ERR);
+    }
 }
 
 // Append a command for the sender; the lock must be held. False when the queue is
@@ -331,6 +342,7 @@ static void handle_cmdack(const uint8_t *rx, int n)
         memmove(&s_cmdq[0], &s_cmdq[1], (size_t)(s_cmdq_len - 1) * sizeof(link_cmd_t));
         s_cmdq_len--;
         ESP_LOGI(TAG, "Sender: %s", s_cmd_state);
+        led_event(LED_EV_COMMAND);
         // A reboot is answered before the restart, so that answer still carries the
         // old settings (WiFi off, say). Ask again once it is back up.
         if (op == LINK_CMD_REBOOT) {
@@ -392,6 +404,7 @@ static void handle_cfg(const uint8_t *rx, int n)
 
     link_set_cfg(&want, false);
     link_profile_provisional(&old, silence_s);
+    led_event(LED_EV_PROFILE);
 }
 
 // The sample is logged exactly as it arrived. No scaling happens here: the sender
@@ -498,6 +511,9 @@ static void receiver_task(void *arg)
         }
 
         const int n = sx126x_rx_wait(rx, sizeof(rx), &info, 500);
+        if (n < 0) {
+            led_event(LED_EV_CRC);
+        }
 
         // Anything shorter than a header is noise that happened to pass CRC, or a
         // stray packet from another network; it must not be read as a header.
@@ -539,6 +555,10 @@ static void receiver_task(void *arg)
                         // standby; go back to listening before logging, so the
                         // log line cannot eat into the next packet's preamble.
                         listening = (sx126x_rx_start(0) == ESP_OK);
+                        if (entry.gap > 0) {
+                            led_event(LED_EV_LOST);
+                        }
+                        led_link_quality(entry.snr_margin);
                         log_packet(&entry);
                         checkpoint();
                         break;
@@ -570,8 +590,15 @@ static void receiver_task(void *arg)
 
                 // Any frame is contact, and test packets mean it is running.
                 lock();
+                const int64_t now_us = esp_timer_get_time();
+                if (s_contact_seen) {
+                    const int64_t gap_ms = (now_us - s_contact_us) / 1000;
+                    s_contact_gap_ms[s_contact_gap_i] =
+                        gap_ms > UINT32_MAX ? UINT32_MAX : (uint32_t)gap_ms;
+                    s_contact_gap_i = (s_contact_gap_i + 1) % CONTACT_GAPS;
+                }
                 s_contact_seen = true;
-                s_contact_us   = esp_timer_get_time();
+                s_contact_us   = now_us;
                 if (h->type == PKT_PING || h->type == PKT_BATT) {
                     s_sender_stopped = false;
                 }
@@ -665,6 +692,21 @@ void receiver_get_status(receiver_status_t *out)
     }
     out->contact_seen   = s_contact_seen;
     out->contact_age_s  = s_contact_seen ? (uint32_t)((now - s_contact_us) / 1000000) : 0;
+    // Down once silence runs past three of the longest recent gaps, or the
+    // sender's own interval when it has told us, and never sooner than
+    // LINK_LOST_MIN_S. So a 10-minute interval is not "down" between packets,
+    // and a broken link at a 5 s cadence shows within 20 s.
+    uint32_t cadence_ms = s_sender_known ? s_sender.interval_ms : 0;
+    for (int i = 0; i < CONTACT_GAPS; i++) {
+        if (s_contact_gap_ms[i] > cadence_ms) {
+            cadence_ms = s_contact_gap_ms[i];
+        }
+    }
+    uint64_t lost_after_s = (3ull * cadence_ms) / 1000 + 1;
+    if (lost_after_s < LINK_LOST_MIN_S) {
+        lost_after_s = LINK_LOST_MIN_S;
+    }
+    out->link_lost = s_contact_seen && out->contact_age_s > lost_after_s;
     out->sender_stopped = s_sender_stopped;
     out->log_seq          = s_log_seq;
     out->pdr              = pdr_locked();

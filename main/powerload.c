@@ -302,6 +302,11 @@ bool powerload_is_on(void)
     return s_on;
 }
 
+bool powerload_is_active(void)
+{
+    return s_on && s_armed;
+}
+
 uint32_t powerload_arming_in_s(void)
 {
     if (s_armed) {

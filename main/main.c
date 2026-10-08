@@ -11,6 +11,8 @@
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 
+#include "console.h"
+#include "led.h"
 #include "link.h"
 #include "net.h"
 #include "runstate.h"
@@ -71,12 +73,16 @@ void app_main(void)
     // Before anything that reads it - the radio tasks report it in every packet and
     // the dashboard shows it - so no two tasks race to set the pins up.
     charge_gpio_init_once();
+    // Before the radio, so a radio that never comes up can still be shown. Not
+    // fatal either: the rig works without its indicator.
+    led_init();
 
     // Radio first: a wiring fault should surface before WiFi fills the log.
     esp_err_t err = sx126x_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "SX1262 init failed (%s).", esp_err_to_name(err));
         ESP_LOGE(TAG, "Check NSS/SCK/MOSI/MISO/RST/BUSY wiring and 3V3 to the module.");
+        led_set_fatal();
         while (1) {
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
@@ -105,10 +111,13 @@ void app_main(void)
 #else
     ESP_ERROR_CHECK(receiver_start());
 #endif
+    led_status_start();
 
     if (net_wifi_is_on()) {
         webserver_start();
     }
+    // Answers from the web server over loopback, so after it.
+    console_start();
 
     ESP_LOGI(TAG, "Ready - dashboard at http://%s/", net_ip_str());
 }

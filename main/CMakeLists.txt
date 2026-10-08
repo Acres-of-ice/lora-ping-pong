@@ -18,6 +18,8 @@ idf_component_register(
         "powerload.c"
         "runstate.c"
         "solar.c"
+        "led.c"
+        "console.c"
     INCLUDE_DIRS "."
     EMBED_FILES ${embed_page}
     PRIV_REQUIRES
@@ -31,4 +33,7 @@ idf_component_register(
         esp_adc
         esp_timer
         esp_driver_gpio
+        esp_driver_rmt
+        esp_driver_usb_serial_jtag
+        lwip
 )

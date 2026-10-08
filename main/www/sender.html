@@ -69,6 +69,11 @@
   footer { color:var(--muted); font-size:.75rem; margin-top:14px; }
   .banner { border-radius:8px; padding:8px 12px; margin-bottom:12px; font-size:.85rem; }
   .banner.provisional { background:#3a2e14; border:1px solid var(--warning); color:#f4d79a; }
+  .ledDot { display:inline-block; width:14px; height:14px; border-radius:50%; margin-right:6px;
+            vertical-align:middle; border:1px solid var(--border); }
+  .legend { margin-top:10px; }
+  .legend summary { cursor:pointer; color:var(--ink); }
+  .legend td { text-align:left; white-space:normal; }
 </style>
 </head>
 <body>
@@ -231,6 +236,46 @@
       </table>
     </div>
     <footer id="logInfo">No packets yet.</footer>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <h2>Status LED</h2>
+      <div><span id="ledDot" class="ledDot"></span><b id="ledPattern">–</b></div>
+    </div>
+    <div class="fields">
+      <div>
+        <label class="f" for="ledLevel">Brightness, 0–255 (0 = off)</label>
+        <input id="ledLevel" type="number" min="0" max="255" step="1">
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div class="derived" id="ledNote" style="margin-top:0"></div>
+      <div><button id="ledSave">Save brightness</button> <button id="ledTest">Test colours</button></div>
+    </div>
+    <details class="derived legend">
+      <summary>What the colours mean</summary>
+      <div class="tablewrap" style="max-height:none">
+        <table>
+          <tr><td class="l"><span class="ledDot" style="background:#fff"></span>Solid white, full brightness</td><td class="l">Max drain is running. White lights all three dies at full current: the most power the LED can draw.</td></tr>
+          <tr><td class="l"><span class="ledDot" style="background:#fff"></span>White, blinking twice a second</td><td class="l">Max drain is on and will start when the boot delay ends.</td></tr>
+          <tr><td class="l"><span class="ledDot" style="background:#00f"></span>Blue tick</td><td class="l">A packet went out.</td></tr>
+          <tr><td class="l"><span class="ledDot" style="background:linear-gradient(90deg,#0f0 25%,#80ff00 25% 50%,#ff8c00 50% 75%,#ff3200 75%)"></span>Green / yellow-green / amber / orange flash</td><td class="l">Acknowledged. The colour is the SNR margin of the weaker direction: 10 dB or more / 5–10 / 0–5 / below 0.</td></tr>
+          <tr><td class="l"><span class="ledDot" style="background:#f00"></span>Long red flash</td><td class="l">No acknowledgement came back.</td></tr>
+          <tr><td class="l"><span class="ledDot" style="background:#f00"></span>Red double flash</td><td class="l">The radio refused to transmit.</td></tr>
+          <tr><td class="l"><span class="ledDot" style="background:#a0f"></span>Violet double flash</td><td class="l">Carried out a command from the receiver's dashboard.</td></tr>
+          <tr><td class="l"><span class="ledDot" style="background:#0ff"></span>Cyan triple flash</td><td class="l">A new radio profile went live (provisional).</td></tr>
+          <tr><td class="l"><span class="ledDot" style="background:linear-gradient(90deg,#f00 50%,#0ff 50%)"></span>Red, then cyan</td><td class="l">The provisional profile carried nothing and was rolled back.</td></tr>
+          <tr><td class="l"><span class="ledDot" style="background:linear-gradient(90deg,#0f0 50%,#0ff 50%)"></span>Green, then cyan</td><td class="l">The provisional profile proved itself and was saved.</td></tr>
+          <tr><td class="l"><span class="ledDot" style="background:#f00"></span>Red blink every 2 s</td><td class="l">Link down: three exchanges in a row went unanswered.</td></tr>
+          <tr><td class="l"><span class="ledDot" style="background:#0ff"></span>Cyan double blink every 2 s</td><td class="l">The radio profile is still provisional.</td></tr>
+          <tr><td class="l"><span class="ledDot" style="background:#ff3200"></span>Orange triple blink every 4 s</td><td class="l">Battery below <span id="ledLowV">–</span> V.</td></tr>
+          <tr><td class="l"><span class="ledDot" style="background:#ff8c00"></span>Amber blink every 3 s</td><td class="l">Stopped; still checking in with the receiver.</td></tr>
+          <tr><td class="l"><span class="ledDot" style="background:#0f0"></span>Green blip every 5 s</td><td class="l">Idle and healthy. Only shows when nothing else has lit the LED for 5 s.</td></tr>
+          <tr><td class="l"><span class="ledDot" style="background:#f00"></span>Red, blinking 5 times a second</td><td class="l">The radio failed to start: wiring or 3V3 to the module.</td></tr>
+        </table>
+      </div>
+    </details>
   </div>
 
   <div class="panel">
@@ -457,6 +502,29 @@ $("wifiOff").onclick = () => {
   post("/wifi?on=0");
 };
 
+/* ---- status LED ---- */
+function ledShow(d) {
+  // The LED runs dim, so show the hue it has at this instant at full strength.
+  const v = parseInt((d.led_rgb || "#000000").slice(1), 16);
+  const rgb = [v >> 16, (v >> 8) & 255, v & 255], m = Math.max(...rgb);
+  $("ledDot").style.background = m ? `rgb(${rgb.map(c => Math.round(c * 255 / m)).join(",")})` : "transparent";
+  $("ledPattern").textContent = d.led;
+  if (d.led_low_mv) $("ledLowV").textContent = (d.led_low_mv / 1000).toFixed(2);
+  if (document.activeElement !== $("ledLevel")) $("ledLevel").value = d.led_level;
+  $("ledNote").textContent = d.led_level === 0
+    ? "Status blinks off. Warnings (radio fault, max drain) still show."
+    : "Max drain overrides this: solid white at full brightness while the load runs.";
+}
+$("ledSave").onclick = async () => {
+  const v = Number($("ledLevel").value);
+  if (!Number.isInteger(v) || v < 0 || v > 255) { alert("Brightness must be 0..255"); return; }
+  const r = await fetch(`/led?level=${v}`, { cache: "no-store" });
+  if (!r.ok) alert("Rejected: " + await r.text());
+  $("ledLevel").blur();
+  pollStatus();
+};
+$("ledTest").onclick = () => fetch("/led?test=1", { cache: "no-store" }).catch(() => {});
+
 /* ---- status polling ---- */
 let baseUptime = 0, baseAt = performance.now(), synced = false;
 function tickUptime() {
@@ -468,6 +536,7 @@ async function pollStatus() {
   try { d = await (await fetch("/status", { cache: "no-store" })).json(); }
   catch (e) { setConn(false); return; }
   setConn(true);
+  ledShow(d);
 
   $("ssid").textContent = d.ssid;
   $("ip").textContent = d.ip;

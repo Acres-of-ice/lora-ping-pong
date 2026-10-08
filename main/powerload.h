@@ -40,5 +40,9 @@ void powerload_pause_for_join(void);
 // Operator intent. May be true while the boot delay is still running.
 bool powerload_is_on(void);
 
+// On and past the boot delay: the load is actually being drawn (the breathing gaps
+// and a join's grace pause aside). The status LED goes solid white on this.
+bool powerload_is_active(void);
+
 // Seconds until the load actually starts; 0 once armed.
 uint32_t powerload_arming_in_s(void);

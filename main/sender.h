@@ -38,6 +38,7 @@ typedef struct {
     float    last_local_rssi, last_local_snr;
     uint32_t log_seq;         // total log entries ever written; a cursor for the UI
     uint8_t  peer_charge;     // receiver's solar charger (charge_state_t), from its ACKs
+    uint32_t consec_miss;     // exchanges in a row with no answer; 0 while the link is up
 } sender_status_t;
 
 esp_err_t sender_start(void);

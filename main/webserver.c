@@ -11,7 +11,9 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "led.h"
 #include "link.h"
+#include "lwip/sockets.h"
 #include "net.h"
 #include "sdkconfig.h"
 #include "solar.h"
@@ -30,6 +32,36 @@ extern const uint8_t page_end[]   asm("_binary_receiver_html_end");
 #endif
 
 static const char *TAG = "web";
+
+#ifndef CONFIG_LED_LOW_BATT_MV
+#define CONFIG_LED_LOW_BATT_MV 0  // LED disabled in menuconfig
+#endif
+
+// Shared by both /status routes: whether the board has reset, why, and its heap, so
+// a long run can tell a brownout or a leak from the dashboard alone.
+static const char *reset_reason_name(esp_reset_reason_t r)
+{
+    switch (r) {
+        case ESP_RST_POWERON:  return "power-on";
+        case ESP_RST_SW:       return "software";
+        case ESP_RST_PANIC:    return "panic";
+        case ESP_RST_INT_WDT:
+        case ESP_RST_TASK_WDT:
+        case ESP_RST_WDT:      return "watchdog";
+        case ESP_RST_BROWNOUT: return "brownout";
+        case ESP_RST_USB:      return "usb";
+        case ESP_RST_EXT:      return "external";
+        default:               return "other";
+    }
+}
+
+static int health_json(char *buf, size_t n)
+{
+    return snprintf(buf, n,
+        "\"boot_s\":%lld,\"reset_reason\":\"%s\",\"heap_free\":%lu,\"heap_min\":%lu,",
+        (long long)(esp_timer_get_time() / 1000000), reset_reason_name(esp_reset_reason()),
+        (unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size());
+}
 
 #define QUERY_MAX 256
 
@@ -201,6 +233,48 @@ static esp_err_t reboot_handler(httpd_req_t *req)
     return send_json(req, "{\"rebooting\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
+// GET /led            -> what the status LED is showing
+// GET /led?level=24   -> status brightness 0..255, saved (0 = indicator off)
+// GET /led?test=1     -> red, green, blue, white at full brightness, to check it
+static esp_err_t led_handler(httpd_req_t *req)
+{
+    char query[QUERY_MAX];
+    get_query(req, query, sizeof(query));
+    long v;
+    if (q_long(query, "level", &v)) {
+        const esp_err_t err = led_set_level((int)v);
+        if (err == ESP_ERR_INVALID_ARG) {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "level must be 0..255");
+        }
+        if (err != ESP_OK) {
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                       "level applied but could not be saved");
+        }
+    }
+    if (q_is(query, "test", "1")) {
+        led_self_test();
+    }
+    if (q_is(query, "trace", "1")) {
+        led_trace_t t[LED_TRACE_LEN];
+        const int count = led_trace(t, LED_TRACE_LEN);
+        static char tb[LED_TRACE_LEN * 56 + 64];
+        int k = snprintf(tb, sizeof(tb), "{\"now_ms\":%lld,\"trace\":[",
+                         (long long)(esp_timer_get_time() / 1000));
+        // Sized for the longest pattern name; the guard only matters if one is added
+        // that is longer still, when the newest entries are dropped, not overrun.
+        for (int i = 0; i < count && k < (int)sizeof(tb) - 64; i++) {
+            k += snprintf(tb + k, sizeof(tb) - k, "%s[%lld,\"#%06lx\",\"%s\"]", i ? "," : "",
+                          (long long)t[i].at_ms, (unsigned long)t[i].rgb, t[i].pattern);
+        }
+        k += snprintf(tb + k, sizeof(tb) - k, "]}");
+        return send_json(req, tb, k);
+    }
+    char buf[96];
+    const int n = snprintf(buf, sizeof(buf), "{\"level\":%u,\"pattern\":\"%s\",\"rgb\":\"#%06lx\"}",
+                           led_level(), led_pattern(), (unsigned long)led_rgb());
+    return send_json(req, buf, n);
+}
+
 // Accumulates a chunked response into ~1 KB writes. Sending one chunk per log
 // entry meant up to 128 tiny TCP writes per poll, which is what makes a congested
 // link (a phone on a saturated SoftAP, or max-drain mode blasting broadcasts) time
@@ -265,18 +339,21 @@ static esp_err_t status_handler(httpd_req_t *req)
     sender_cfg_push_state(push, sizeof(push));
     sender_remote_command_state(remote, sizeof(remote));
 
-    char buf[1536];
+    // Static, as on the receiver: the HTTP server runs one handler at a time, and
+    // this is too big to share the handler's stack with the formatting.
+    static char buf[2048];
     int n = snprintf(buf, sizeof(buf),
         "{\"role\":\"sender\",\"mode\":\"%s\",\"ip\":\"%s\",\"ssid\":\"%s\","
         "\"wifi\":%s,\"running\":%s,\"interval_ms\":%lu,"
         "\"tx\":%lu,\"ack\":%lu,\"timeout\":%lu,\"ack_rate\":%.1f,"
-        "\"next_seq\":%lu,\"last_rtt_ms\":%lu,"
+        "\"next_seq\":%lu,\"last_rtt_ms\":%lu,\"consec_miss\":%lu,"
         "\"ack_rssi\":%.1f,\"ack_snr\":%.1f,\"local_rssi\":%.1f,\"local_snr\":%.1f,"
         "\"ack_airtime_ms\":%.2f,\"duty_cycle\":%.4f,\"log_seq\":%lu,"
         "\"pin_mv\":%d,\"batt_mv\":%d,\"ratio\":%.3f,\"uptime_s\":%lu,"
-        "\"load\":%s,\"load_arming_s\":%lu,\"push_busy\":%s,\"push_state\":\"%s\","
+        "\"load\":%s,\"load_arming_s\":%lu,\"led_low_mv\":%d,\"push_busy\":%s,\"push_state\":\"%s\","
         "\"remote_cmd\":\"%s\",\"charge\":\"%s\",\"peer_charge\":\"%s\","
-        "\"apply_pending\":%s,\"rollback_pending\":%s,\"rollback_s\":%lu,",
+        "\"apply_pending\":%s,\"rollback_pending\":%s,\"rollback_s\":%lu,"
+        "\"led\":\"%s\",\"led_rgb\":\"#%06lx\",\"led_level\":%u,",
         link_mode_str(link_get_mode()), net_ip_str(), net_ssid(),
         net_wifi_is_on() ? "true" : "false",
         st.running ? "true" : "false", (unsigned long)st.interval_ms,
@@ -284,17 +361,20 @@ static esp_err_t status_handler(httpd_req_t *req)
         (unsigned long)st.timeout_count,
         st.tx_count ? (100.0f * (float)st.ack_count / (float)st.tx_count) : 0.0f,
         (unsigned long)st.next_seq, (unsigned long)st.last_rtt_ms,
+        (unsigned long)st.consec_miss,
         st.last_ack_rssi, st.last_ack_snr, st.last_local_rssi, st.last_local_snr,
         st.ack_airtime_ms, st.duty_cycle, (unsigned long)st.log_seq,
         pin_mv, battery_mv_from_pin(pin_mv), battery_ratio_x1000() / 1000.0, (unsigned long)up,
         powerload_is_on() ? "true" : "false",
-        (unsigned long)powerload_arming_in_s(),
+        (unsigned long)powerload_arming_in_s(), CONFIG_LED_LOW_BATT_MV,
         sender_cfg_push_busy() ? "true" : "false", push, remote,
         charge_state_str(charge_state()), charge_state_str((charge_state_t)st.peer_charge),
         link_apply_queued() ? "true" : "false",
         link_profile_is_provisional() ? "true" : "false",
-        (unsigned long)link_profile_revert_in_s());
+        (unsigned long)link_profile_revert_in_s(),
+        led_pattern(), (unsigned long)led_rgb(), led_level());
 
+    n += health_json(buf + n, sizeof(buf) - n);
     n += link_cfg_json(buf + n, sizeof(buf) - n, &cfg, st.payload_len);
     n += snprintf(buf + n, sizeof(buf) - n, "}");
     return send_json(req, buf, n);
@@ -547,7 +627,8 @@ static esp_err_t status_handler(httpd_req_t *req)
         "\"log_seq\":%lu,\"have_batt\":%s,\"pin_mv\":%u,\"batt_mv\":%lu,\"ratio\":%.3f,"
         "\"batt_uptime_s\":%lu,"
         "\"charge\":\"%s\",\"peer_charge\":\"%s\","
-        "\"apply_pending\":%s,\"rollback_pending\":%s,\"rollback_s\":%lu,",
+        "\"apply_pending\":%s,\"rollback_pending\":%s,\"rollback_s\":%lu,"
+        "\"led\":\"%s\",\"led_rgb\":\"#%06lx\",\"led_level\":%u,",
         link_mode_str(link_get_mode()), net_ip_str(), net_ssid(),
         (unsigned long)st.rx_count, (unsigned long)st.lost, (unsigned long)st.dup,
         (unsigned long)st.out_of_order, st.crc_err, st.hdr_err, st.pdr,
@@ -561,23 +642,25 @@ static esp_err_t status_handler(httpd_req_t *req)
         charge_state_str(charge_state()), charge_state_str((charge_state_t)st.peer_charge),
         link_apply_queued() ? "true" : "false",
         link_profile_is_provisional() ? "true" : "false",
-        (unsigned long)link_profile_revert_in_s());
+        (unsigned long)link_profile_revert_in_s(),
+        led_pattern(), (unsigned long)led_rgb(), led_level());
 
     n += snprintf(buf + n, sizeof(buf) - n,
         "\"cmd_queued\":%d,\"cmd_waiting\":\"%s\",\"cmd_state\":\"%s\","
-        "\"contact_seen\":%s,\"contact_age_s\":%lu,\"sender_stopped\":%s,"
+        "\"contact_seen\":%s,\"contact_age_s\":%lu,\"sender_stopped\":%s,\"link_lost\":%s,"
         "\"sender_known\":%s,\"sender_age_s\":%lu,\"sender_running\":%s,"
         "\"sender_mode\":\"%s\",\"sender_interval_ms\":%lu,\"sender_payload\":%u,"
         "\"sender_load\":%s,\"sender_wifi\":%s,\"sender_ratio\":%.3f,",
         st.cmd_queued, st.cmd_waiting, st.cmd_state,
         st.contact_seen ? "true" : "false", (unsigned long)st.contact_age_s,
-        st.sender_stopped ? "true" : "false",
+        st.sender_stopped ? "true" : "false", st.link_lost ? "true" : "false",
         st.sender_known ? "true" : "false", (unsigned long)st.sender_age_s,
         st.sender_running ? "true" : "false", link_mode_str((link_mode_t)st.sender_mode),
         (unsigned long)st.sender_interval_ms, st.sender_payload,
         st.sender_load ? "true" : "false", st.sender_wifi ? "true" : "false",
         st.sender_ratio_x1000 / 1000.0);
 
+    n += health_json(buf + n, sizeof(buf) - n);
     n += link_cfg_json(buf + n, sizeof(buf) - n, &cfg, LINK_MAX_PAYLOAD);
     n += snprintf(buf + n, sizeof(buf) - n, "}");
     return send_json(req, buf, n);
@@ -788,16 +871,55 @@ static esp_err_t sendercmd_handler(httpd_req_t *req)
 
 // ------------------------------------------------------------------ start ----
 
+// Every response goes out as several small writes - httpd sends the status line and
+// each header field separately - and with Nagle on, the body then waits for the
+// client to ACK them. lwIP delays that ACK by up to 250 ms, so the serial console's
+// loopback requests (see console.c) took a quarter of a second each. Loopback only:
+// a phone ACKs promptly, and over WiFi Nagle's coalescing is what keeps those
+// header writes from going out as a dozen separate frames into a busy channel.
+static bool peer_is_loopback(int sockfd)
+{
+    struct sockaddr_storage peer;
+    socklen_t len = sizeof(peer);
+    if (getpeername(sockfd, (struct sockaddr *)&peer, &len) != 0) {
+        return false;
+    }
+    if (peer.ss_family == AF_INET) {
+        return ((struct sockaddr_in *)&peer)->sin_addr.s_addr == htonl(INADDR_LOOPBACK);
+    }
+#if CONFIG_LWIP_IPV6
+    // httpd listens on IPv6 when lwIP has it, so an IPv4 client shows up mapped:
+    // ::ffff:127.0.0.1.
+    if (peer.ss_family == AF_INET6) {
+        const struct in6_addr *a = &((struct sockaddr_in6 *)&peer)->sin6_addr;
+        static const uint8_t mapped[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 };
+        static const uint8_t v6[16]     = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+        return memcmp(a, mapped, 16) == 0 || memcmp(a, v6, 16) == 0;
+    }
+#endif
+    return false;
+}
+
+static esp_err_t on_open(httpd_handle_t hd, int sockfd)
+{
+    if (peer_is_loopback(sockfd)) {
+        const int one = 1;
+        setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    }
+    return ESP_OK;
+}
+
 esp_err_t webserver_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 16;  // the sender registers 13; a 13th past the limit fails silently
+    config.max_uri_handlers = 16;  // the sender registers 14; one past the limit fails silently
     config.stack_size       = 6144;  // the log handlers format a lot of JSON
     // The default 5 s is tight when max-drain mode is saturating the WiFi TX path
     // or a phone client is dozing; both show up as EAGAIN on send.
     config.send_wait_timeout = 10;
     config.recv_wait_timeout = 10;
+    config.open_fn           = on_open;
 
     httpd_handle_t server = NULL;
     esp_err_t ret = httpd_start(&server, &config);
@@ -811,6 +933,7 @@ esp_err_t webserver_start(void)
         { .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_handler },
         { .uri = "/radio",       .method = HTTP_GET, .handler = radio_handler },
         { .uri = "/reboot",      .method = HTTP_GET, .handler = reboot_handler },
+        { .uri = "/led",         .method = HTTP_GET, .handler = led_handler },
         { .uri = "/status",      .method = HTTP_GET, .handler = status_handler },
         { .uri = "/log",         .method = HTTP_GET, .handler = log_handler },
 #if CONFIG_ROLE_SENDER
