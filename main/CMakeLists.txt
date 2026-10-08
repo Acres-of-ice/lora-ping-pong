@@ -16,6 +16,8 @@ idf_component_register(
         "battery.c"
         "storage.c"
         "powerload.c"
+        "runstate.c"
+        "solar.c"
     INCLUDE_DIRS "."
     EMBED_FILES ${embed_page}
     PRIV_REQUIRES
@@ -28,4 +30,5 @@ idf_component_register(
         spiffs
         esp_adc
         esp_timer
+        esp_driver_gpio
 )

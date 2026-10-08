@@ -223,10 +223,11 @@ esp_err_t powerload_init(void)
     peer.encrypt = false;
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
 
-    // Decide the boot state. Defaults to on, so a battery run resumes the same load
-    // after the brownout it is expected to provoke near end of life - otherwise the
-    // discharge curve gets a kink that looks like the cell recovering.
-    bool on = nvs_get_u8_or(NVS_KEY_ON, 1) != 0;
+    // Decide the boot state: off on a fresh board, then whatever was last saved. The
+    // saved state is what matters - a battery run resumes the same load after the
+    // brownout it is expected to provoke near end of life, or the discharge curve
+    // gets a kink that looks like the cell recovering.
+    bool on = nvs_get_u8_or(NVS_KEY_ON, 0) != 0;
 
     // ...but a load the supply genuinely cannot carry browns out immediately and
     // repeatedly, and persisting it would make that unrecoverable. Track consecutive

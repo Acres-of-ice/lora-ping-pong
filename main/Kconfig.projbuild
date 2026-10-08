@@ -33,9 +33,10 @@ menu "LoRa Test Rig"
 				at least half the bandwidth inside the band (BW 250 kHz needs
 				865.125 MHz or above).
 
-				The SX1262 covers 150-960 MHz, but the module's matching network and
-				antenna do not: the Ra-01SH is built for 803-930 MHz (see
-				SX126X_FREQ_MIN_KHZ / SX126X_FREQ_MAX_KHZ).
+				Anything the SX1262 tunes (150-960 MHz) is accepted, here and from the
+				dashboard. The Ra-01SH's matching network and antenna are built for
+				803-930 MHz, though: outside that the radio works, but range drops
+				sharply.
 
 		config LINK_DEFAULT_SF
 			int "Spreading factor"
@@ -49,8 +50,11 @@ menu "LoRa Test Rig"
 
 		config LINK_DEFAULT_PREAMBLE
 			int "Preamble length (symbols)"
-			range 6 65535
+			range 1 65535
 			default 8
+			help
+				The SX1262 takes 1-65535. Short preambles give the receiver little to
+				lock onto, so packets get missed more easily; 8 is the usual default.
 
 		config LINK_DEFAULT_TX_DBM
 			int "Transmit power (dBm)"
@@ -78,13 +82,15 @@ menu "LoRa Test Rig"
 
 		config SENDER_DEFAULT_PAYLOAD
 			int "Payload size (bytes)"
-			range 16 255
+			range 17 255
 			default 255
 			help
 				255 is the LoRa maximum and the honest worst case for a range test.
 				Be aware what it costs: at SF12/BW125 one packet is ~9.0 s in the
-				air. The 13-byte acknowledgement adds ~1.2 s, so a full exchange is
+				air. The 14-byte acknowledgement adds ~1.2 s, so a full exchange is
 				~10.2 s. The dashboard shows both live so you can trade it off.
+
+				17 is the floor: the battery packet must fit.
 	endmenu
 
 	menu "Network"
@@ -102,16 +108,21 @@ menu "LoRa Test Rig"
 
 		config NET_AP_SSID_PREFIX
 			string "AP SSID prefix"
-			default "LORA-TEST"
+			default "lora"
 			help
-				The last two bytes of the MAC are appended, so the two boards are
-				distinguishable on air.
+				The role is appended: "-send" on the sender, "-recv" on the
+				receiver. The two boards are told apart on air, and flipping a
+				board's role renames its access point with it.
 
 		config NET_AP_PASSWORD
 			string "AP password"
-			default "loratest"
+			default ""
 			help
-				Minimum 8 characters for WPA2. Leave empty for an open network.
+				Empty (the default) runs an open network: anyone in range can join
+				and use the dashboard, including reboot and config push. For WPA2
+				set 8-63 characters. A shorter password cannot start the access
+				point at all, so the build refuses it rather than leave the board
+				in a reboot loop.
 
 		config NET_AP_CHANNEL
 			int "AP channel"
@@ -133,7 +144,7 @@ menu "LoRa Test Rig"
 			range 0 120
 			default 15
 			help
-				The load is on by default and its state is saved, so a load heavy
+				The load's on/off state is saved, so once switched on, a load heavy
 				enough to brown the board out would otherwise persist itself into a
 				reset loop with no window to switch it off. This delay guarantees the
 				dashboard is always reachable for at least this long after boot.
@@ -169,8 +180,8 @@ menu "LoRa Test Rig"
 				The broadcast flood saturates the WiFi transmit path, which starves
 				the WPA2 four-way handshake: a client associates and is then deauthed
 				with reason 15 (4WAY_HANDSHAKE_TIMEOUT) a few seconds later. Since the
-				load is on by default and persisted, that locks you out of the very
-				dashboard you would use to turn it off.
+				load's state is persisted, that locks you out of the very dashboard you
+				would use to turn it off.
 
 				This pauses the flood briefly and periodically so association and TCP
 				get a clear window. The default 50 ms every 500 ms costs about 10% of
@@ -203,18 +214,18 @@ menu "LoRa Test Rig"
 				On the Repeater PCB the BAT+ divider (R12 100k over R13 30k, C11
 				100nF) feeds IO0, which is ADC1 channel 0.
 
-				The firmware reports the voltage at the pin; the battery voltage is
-				that times (100k + 30k) / 30k = 4.333. A full 4.2 V cell reads about
-				969 mV at the pin.
-
-		config LOG_INTERVAL_S
-			int "Discharge-clock checkpoint interval (seconds)"
-			range 5 3600
-			default 300
+		config BATTERY_DIVIDER_X1000
+			int "Battery divider ratio x1000 (until calibrated)"
+			range 1000 20000
+			default 4333
 			help
-				How often the sender writes its discharge clock to NVS so the run
-				survives a brownout. Shorter loses less time on a reset but writes
-				to flash more often over a multi-day test.
+				Battery millivolts per sense-pin millivolt, times 1000. The Repeater
+				PCB's 100k/30k divider is nominally (100k + 30k) / 30k = 4.333.
+
+				Resistor tolerance and ADC gain error move the real figure a long way
+				from that - one board read 873 mV at the pin with 4.16 V on the cell,
+				a ratio of 4.77. Calibrate it from the sender dashboard against a
+				multimeter; the result is saved to NVS and replaces this value.
 	endmenu
 
 endmenu

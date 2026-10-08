@@ -6,6 +6,7 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -29,7 +30,6 @@ static const char *TAG = "sx126x";
 #define CMD_GET_IRQ_STATUS         0x12
 #define CMD_CLR_IRQ_STATUS         0x02
 #define CMD_SET_DIO2_AS_RF_SWITCH  0x9D
-#define CMD_SET_DIO3_AS_TCXO_CTRL  0x97
 #define CMD_CLR_DEVICE_ERRORS      0x07
 #define CMD_SET_RF_FREQUENCY       0x86
 #define CMD_SET_PACKET_TYPE        0x8A
@@ -51,6 +51,9 @@ static const char *TAG = "sx126x";
 #define REG_OCP            0x08E7
 #define REG_TX_CLAMP       0x08D8
 #define REG_TX_MODULATION  0x0889
+// Frequency error of the last LoRa packet, 3 bytes. Not in Semtech's datasheet;
+// the address, layout and scaling are RadioLib's (SX126x::getFrequencyError).
+#define REG_FREQ_ERROR     0x076B
 
 // ---- IRQ bits ----
 #define IRQ_TX_DONE     0x0001
@@ -63,20 +66,13 @@ static const char *TAG = "sx126x";
 #define STDBY_RC        0x00
 #define PACKET_TYPE_LORA 0x01
 #define REGULATOR_LDO   0x00
-#define REGULATOR_DCDC  0x01
-#if CONFIG_SX126X_DCDC
-#define REGULATOR_MODE  REGULATOR_DCDC
-#define REGULATOR_NAME  "DC-DC"
-#else
-#define REGULATOR_MODE  REGULATOR_LDO
-#define REGULATOR_NAME  "LDO"
-#endif
 #define RAMP_200U       0x04
 #define LORA_HEADER_EXPLICIT 0x00
 
-// GetDeviceErrors bits. XOSC_START_ERR is the one that matters most here: with an
-// unpowered TCXO the chip happily accepts every command over SPI (that runs off
-// the RC oscillator) but can never enter TX or RX, because those need the XOSC.
+// GetDeviceErrors bits. XOSC_START_ERR is the one that matters most here: with a
+// crystal that will not start, the chip happily accepts every command over SPI
+// (that runs off the RC oscillator) but can never enter TX or RX, because those
+// need the XOSC.
 #define ERR_RC64K_CALIB  0x0001
 #define ERR_RC13M_CALIB  0x0002
 #define ERR_PLL_CALIB    0x0004
@@ -95,14 +91,19 @@ static const char *TAG = "sx126x";
 // means "continuous" for RX, so finite timeouts stop one short of it.
 #define TIMEOUT_MAX_STEPS 0xFFFFFE
 
-// Convert a millisecond timeout to SetTx/SetRx steps, saturating rather than
-// wrapping. A full-size packet at SF12/BW7.8kHz is ~145 s, and the callers'
-// 2x-airtime budget for it overflowed 24 bits - the truncated value was a few
-// seconds, so the chip aborted the packet with a timeout mid-air.
+// Convert a millisecond timeout to SetTx/SetRx steps without wrapping. A
+// full-size packet at SF12/BW7.8kHz is ~145 s, and the callers' 2x-airtime
+// budget for it overflowed 24 bits - the truncated value was a few seconds, so
+// the chip aborted the packet with a timeout mid-air.
+//
+// A timeout too long for the field becomes 0, which both commands read as "no
+// chip timeout"; the caller's own wait still bounds the operation. Saturating at
+// ~262 s instead would abort any packet with more airtime than that (SF12/BW7.8
+// with CR4/8 and a long preamble gets there).
 static uint32_t timeout_steps(uint32_t timeout_ms)
 {
     const uint64_t steps = (uint64_t)timeout_ms * RTC_STEPS_PER_MS;
-    return steps > TIMEOUT_MAX_STEPS ? TIMEOUT_MAX_STEPS : (uint32_t)steps;
+    return steps > TIMEOUT_MAX_STEPS ? 0 : (uint32_t)steps;
 }
 
 // The chip accepts SPI up to 16 MHz; 8 MHz is comfortable over jumper wiring.
@@ -155,9 +156,14 @@ static void unlock(void) { xSemaphoreGive(s_lock); }
 // here first. A permanent high almost always means miswiring, not firmware.
 static esp_err_t wait_busy(uint32_t timeout_ms)
 {
-    const int64_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms) + 1;
+    // Elapsed ticks by unsigned subtraction, so the comparison survives the tick
+    // counter wrapping (every ~49.7 days at 1 kHz - within reach of a long
+    // battery run). An absolute deadline wrapped to a small value there and
+    // reported a spurious stuck BUSY.
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t limit = pdMS_TO_TICKS(timeout_ms) + 1;
     while (gpio_get_level(CONFIG_SX126X_BUSY_GPIO) == 1) {
-        if ((int64_t)xTaskGetTickCount() > deadline) {
+        if ((TickType_t)(xTaskGetTickCount() - start) > limit) {
             ESP_LOGE(TAG, "BUSY stuck high (GPIO%d) - check wiring/power", CONFIG_SX126X_BUSY_GPIO);
             return ESP_ERR_TIMEOUT;
         }
@@ -298,8 +304,8 @@ static const char *chip_mode_str(uint8_t status)
 //
 // Worth checking before believing any of it. A MISO that nothing is driving
 // reads as alternating 0xAA/0x55, and 0xAAAA happens to set the XOSC_START_ERR
-// bit - so a plain wiring or brownout fault reports itself as a TCXO problem
-// and sends you off measuring a voltage that was never wrong.
+// bit - so a plain wiring or brownout fault reports itself as a dead crystal
+// and sends you off suspecting a module that was never at fault.
 static bool reply_is_garbage(uint8_t status, uint16_t errors)
 {
     const uint8_t mode = (status >> 4) & 0x07;
@@ -331,44 +337,24 @@ static void log_diagnostics(const char *what)
         return;
     }
     if (err & ERR_XOSC_START) {
-        ESP_LOGE(TAG, "  XOSC_START_ERR - the crystal/TCXO never started.");
-#if CONFIG_SX126X_TCXO
-        // Don't tell anyone to enable an option that is already on - that is how
-        // a real fault gets read as a stale message and ignored.
-        ESP_LOGE(TAG, "  DIO3 TCXO control is already on (voltage selector %d, %d us",
-                 CONFIG_SX126X_TCXO_VOLTAGE, CONFIG_SX126X_TCXO_DELAY_US);
-        ESP_LOGE(TAG, "  startup delay). Check the selector matches the part's supply,");
-        ESP_LOGE(TAG, "  raise the delay, or confirm the module really has a TCXO.");
-#else
-        ESP_LOGE(TAG, "  If this module has a TCXO it needs DIO3 powering it:");
-        ESP_LOGE(TAG, "  enable CONFIG_SX126X_TCXO and check the voltage matches the part.");
-#endif
+        // The Ra-01SH's crystal needs no setup from the host, so there is no
+        // configuration left to get wrong: this is the module or its supply.
+        ESP_LOGE(TAG, "  XOSC_START_ERR - the module's 32 MHz crystal never started.");
+        ESP_LOGE(TAG, "  Check 3V3 at the module under load, then suspect the module.");
     }
     if (err & ERR_PLL_LOCK)  ESP_LOGE(TAG, "  PLL_LOCK_ERR - frequency out of range for this part?");
     if (err & ERR_PA_RAMP)   ESP_LOGE(TAG, "  PA_RAMP_ERR - check the supply can carry the PA current.");
     if (err & ERR_IMG_CALIB) ESP_LOGE(TAG, "  IMG_CALIB_ERR - image calibration band mismatch.");
 }
 
-// The external antenna switch on the Wio-SX1262 needs powering separately from
-// DIO2's internal TX/RX steering. Some module revisions instead want this line
-// driven high only during transmit, hence the Kconfig option. Modules like the
-// Ra-01SH need nothing from the host here: DIO2 alone steers their switch.
-static void rf_switch(bool transmitting)
-{
-#if !CONFIG_SX126X_RFSW_ENABLE
-    (void)transmitting;
-#elif CONFIG_SX126X_RFSW_TX_HIGH
-    gpio_set_level(CONFIG_SX126X_RFSW_GPIO, transmitting ? 1 : 0);
-#else
-    (void)transmitting;
-    gpio_set_level(CONFIG_SX126X_RFSW_GPIO, 1);
-#endif
-}
-
 static void hw_reset(void)
 {
+    // The chip needs NRESET low for ~100 us. Busy-wait rather than
+    // vTaskDelay(pdMS_TO_TICKS(2)): at a 100 Hz tick (the tracked sdkconfig's
+    // setting) that rounds to 0 ticks, so the pulse was a few microseconds long
+    // and the radio was never actually reset.
     gpio_set_level(CONFIG_SX126X_RST_GPIO, 0);
-    vTaskDelay(pdMS_TO_TICKS(2));
+    esp_rom_delay_us(1000);
     gpio_set_level(CONFIG_SX126X_RST_GPIO, 1);
     vTaskDelay(pdMS_TO_TICKS(20));
 }
@@ -416,11 +402,14 @@ float sx126x_airtime_ms(const sx126x_cfg_t *cfg, uint8_t payload_len)
     const int crc = cfg->crc_on ? 1 : 0;
     const int ih  = 0;  // explicit header throughout
 
-    // SF5/SF6 use a longer preamble and take no low-data-rate term.
+    // SF5/SF6 use a longer preamble and take no low-data-rate term, and their
+    // numerator lacks the +8 that SF7-12 carry (SX126x datasheet 6.1.4). The
+    // header adds 20 bits when it is explicit.
     const float n_preamble = (float)cfg->preamble + (sf < 7 ? 6.25f : 4.25f);
     const int   den = (sf < 7) ? (4 * sf) : (4 * (sf - 2 * de));
 
-    const int num = 8 * (int)payload_len - 4 * sf + 28 + 16 * crc - 20 * ih;
+    const int num = 8 * (int)payload_len + 16 * crc - 4 * sf + (sf < 7 ? 0 : 8) +
+                    (ih ? 0 : 20);
     int blocks = (num + den - 1) / den;  // ceil, num can be negative for tiny payloads
     if (blocks < 0) {
         blocks = 0;
@@ -461,7 +450,6 @@ static esp_err_t chip_bringup(void)
     s_ready = false;  // stay unready for the duration; a caller mid-recovery
                        // must see INVALID_STATE, not a half-configured chip.
 
-    rf_switch(false);
     hw_reset();
 
     lock();
@@ -469,38 +457,25 @@ static esp_err_t chip_bringup(void)
 
     BAIL(set_standby());
 
-    // DC-DC only where the module fits the inductor for it; the Ra-01SH does not.
-    const uint8_t reg_mode = REGULATOR_MODE;
+    // The Ra-01SH has no inductor for the SX1262's DC-DC converter, so the chip
+    // runs from its internal LDO in every mode.
+    const uint8_t reg_mode = REGULATOR_LDO;
     BAIL(cmd(CMD_SET_REGULATOR_MODE, &reg_mode, 1));
 
-    // DIO2 drives the module's internal TX/RX steering (on the Ra-01SH it is
-    // wired to the antenna switch inside the module, hence unconnected outside).
+    // Required even though the module's DIO2 pin is unconnected on the PCB: the
+    // Ra-01SH's antenna switch sits inside the module and is driven from DIO2
+    // there. Without this the switch never moves to the transmit path, and
+    // transmit reaches arm's length at best.
     const uint8_t dio2_rf = 0x01;
     BAIL(cmd(CMD_SET_DIO2_AS_RF_SWITCH, &dio2_rf, 1));
 
-#if CONFIG_SX126X_TCXO
-    // Modules like the Wio-SX1262 clock from a TCXO that DIO3 powers. Without this the XOSC
-    // never starts, and the failure is deceptive: every SPI command still works
-    // (STDBY_RC runs off the RC oscillator) but TX and RX silently never happen.
-    // The delay is how long the chip waits for the TCXO to settle, in 15.625 us
-    // steps.
-    const uint32_t tcxo_delay = (uint32_t)CONFIG_SX126X_TCXO_DELAY_US / 16;
-    const uint8_t tcxo[4] = {
-        CONFIG_SX126X_TCXO_VOLTAGE,
-        (uint8_t)(tcxo_delay >> 16), (uint8_t)(tcxo_delay >> 8), (uint8_t)tcxo_delay
-    };
-    BAIL(cmd(CMD_SET_DIO3_AS_TCXO_CTRL, tcxo, sizeof(tcxo)));
-#endif
-
-    // Clear first: the chip latches an XOSC_START_ERR during its own power-up,
-    // before DIO3 was configured, and device errors are sticky until cleared.
-    // Checking before this point reports a failure that has already been fixed.
+    // Clear first: device errors are sticky, and one latched during the chip's
+    // own power-up would otherwise be read below as a failure of this bring-up.
     const uint8_t clr[2] = { 0x00, 0x00 };
     BAIL(cmd(CMD_CLR_DEVICE_ERRORS, clr, sizeof(clr)));
 
-    // Calibrate once the clock source is settled - the datasheet requires a
-    // recalibration after DIO3/TCXO control is configured, because everything
-    // before this point was calibrated against the RC oscillator.
+    // Recalibrate every block (RC oscillators, PLL, ADC, image) from a known state
+    // before the crystal is first used.
     const uint8_t cal_all = 0x7F;
     BAIL(cmd(CMD_CALIBRATE, &cal_all, 1));
     vTaskDelay(pdMS_TO_TICKS(20));
@@ -529,12 +504,7 @@ static esp_err_t chip_bringup(void)
         unlock();
         return ESP_ERR_INVALID_STATE;
     }
-    ESP_LOGI(TAG, "Oscillator started (mode %s%s)", chip_mode_str(osc_status[0]),
-#if CONFIG_SX126X_TCXO
-             ", TCXO on DIO3");
-#else
-             ", crystal");
-#endif
+    ESP_LOGI(TAG, "Oscillator started (mode %s, crystal)", chip_mode_str(osc_status[0]));
     BAIL(set_standby());  // back to STDBY_RC for configuration
 
     const uint8_t pkt_lora = PACKET_TYPE_LORA;
@@ -574,13 +544,10 @@ static esp_err_t chip_bringup(void)
     }
 
     s_ready = true;
-    ESP_LOGI(TAG, "SX1262 up: NSS=%d SCK=%d MOSI=%d MISO=%d RST=%d BUSY=%d DIO1=%d, %s regulator",
+    ESP_LOGI(TAG, "SX1262 up: NSS=%d SCK=%d MOSI=%d MISO=%d RST=%d BUSY=%d DIO1=%d",
              CONFIG_SX126X_NSS_GPIO, CONFIG_SX126X_SCK_GPIO, CONFIG_SX126X_MOSI_GPIO,
              CONFIG_SX126X_MISO_GPIO, CONFIG_SX126X_RST_GPIO, CONFIG_SX126X_BUSY_GPIO,
-             CONFIG_SX126X_DIO1_GPIO, REGULATOR_NAME);
-#if CONFIG_SX126X_RFSW_ENABLE
-    ESP_LOGI(TAG, "RF switch enable on GPIO%d", CONFIG_SX126X_RFSW_GPIO);
-#endif
+             CONFIG_SX126X_DIO1_GPIO);
     return ESP_OK;
 }
 
@@ -593,11 +560,7 @@ esp_err_t sx126x_init(void)
     }
 
     const gpio_config_t out_cfg = {
-        .pin_bit_mask = (1ULL << CONFIG_SX126X_RST_GPIO)
-#if CONFIG_SX126X_RFSW_ENABLE
-                        | (1ULL << CONFIG_SX126X_RFSW_GPIO)
-#endif
-                        ,
+        .pin_bit_mask = (1ULL << CONFIG_SX126X_RST_GPIO),
         .mode         = GPIO_MODE_OUTPUT,
     };
     ESP_ERROR_CHECK(gpio_config(&out_cfg));
@@ -667,19 +630,64 @@ static void note_result(bool ok)
     sx126x_apply(&s_cfg);
 }
 
-// SX1262 high-power PA tiers. Using the tier matched to the requested power
-// keeps efficiency sane instead of always running the +22 dBm setup.
-static void pa_tier_for(int8_t dbm, uint8_t *duty, uint8_t *hp_max)
+// s_ready is only false at runtime after a recovery attempt has failed. Counting
+// that as one more failure keeps the driver retrying the bring-up every
+// RECOVER_AFTER calls; returning without a note left the radio dead until a
+// reboot, however briefly the fault had lasted. If this note is the one that
+// brings the chip back, the caller carries on rather than failing anyway.
+static bool ready_or_note(void)
 {
-    if (dbm >= 22)      { *duty = 0x04; *hp_max = 0x07; }
-    else if (dbm >= 20) { *duty = 0x03; *hp_max = 0x05; }
-    else if (dbm >= 17) { *duty = 0x02; *hp_max = 0x03; }
-    else                { *duty = 0x02; *hp_max = 0x02; }
+    if (!s_ready) {
+        note_result(false);
+    }
+    return s_ready;
+}
+
+// SX1262 HP PA in its full +22 dBm configuration, with the requested power in
+// SetTxParams - what Semtech's reference driver (LoRaMac-node) does.
+//
+// The datasheet's reduced tiers (0x03/0x05 for +20, 0x02/0x03 for +17, 0x02/0x02
+// for +14 dBm) are more efficient, but each delivers its rated power only with
+// SetTxParams held at +22 dBm. Pairing a reduced tier with a reduced SetTxParams
+// value as well, as this used to, shrinks the PA twice: the real output lands
+// several dB under the configured figure that the dashboards' link-budget
+// numbers are computed from. Accurate power is worth a few mA in a range test.
+#define PA_DUTY_CYCLE 0x04
+#define PA_HP_MAX     0x07
+
+// CalibrateImage takes the band to calibrate as two frequencies in 4 MHz steps.
+// Inside one of the datasheet's listed bands, use Semtech's values (863-870 MHz
+// covers the 865-867 MHz plan); anywhere else, calibrate 4 MHz either side of the
+// carrier. Snapping to the nearest listed band instead would leave most of the
+// chip's 150-960 MHz calibrated for somewhere else, weakening image rejection.
+static void image_cal_band(uint32_t freq_hz, uint8_t out[2])
+{
+    static const struct {
+        uint16_t lo_mhz, hi_mhz;
+        uint8_t  f1, f2;
+    } bands[] = {
+        { 430, 440, 0x6B, 0x6F },
+        { 470, 510, 0x75, 0x81 },
+        { 779, 787, 0xC1, 0xC5 },
+        { 863, 870, 0xD7, 0xDB },
+        { 902, 928, 0xE1, 0xE9 },
+    };
+    for (size_t i = 0; i < sizeof(bands) / sizeof(bands[0]); i++) {
+        if (freq_hz >= bands[i].lo_mhz * 1000000u && freq_hz <= bands[i].hi_mhz * 1000000u) {
+            out[0] = bands[i].f1;
+            out[1] = bands[i].f2;
+            return;
+        }
+    }
+    const uint32_t lo_mhz = freq_hz / 1000000u - 4;              // round down, then 4 MHz below
+    const uint32_t hi_mhz = (freq_hz + 999999u) / 1000000u + 4;  // round up, then 4 MHz above
+    out[0] = (uint8_t)(lo_mhz / 4);
+    out[1] = (uint8_t)((hi_mhz + 3) / 4);
 }
 
 esp_err_t sx126x_apply(const sx126x_cfg_t *cfg)
 {
-    if (!s_ready) {
+    if (!ready_or_note()) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -690,7 +698,7 @@ esp_err_t sx126x_apply(const sx126x_cfg_t *cfg)
     if (c.cr > 8)  c.cr = 8;
     if (c.tx_dbm < -9) c.tx_dbm = -9;
     if (c.tx_dbm > 22) c.tx_dbm = 22;
-    if (c.preamble < 6) c.preamble = 6;
+    if (c.preamble < 1) c.preamble = 1;
 
     lock();
     BAIL_NOTE(set_standby());
@@ -701,18 +709,11 @@ esp_err_t sx126x_apply(const sx126x_cfg_t *cfg)
     };
     BAIL_NOTE(cmd(CMD_SET_RF_FREQUENCY, freq_p, sizeof(freq_p)));
 
-    // Image calibration is per band. 863-870 MHz covers the 865-867 MHz plan.
     uint8_t img[2];
-    if (c.freq_hz >= 902000000)      { img[0] = 0xE1; img[1] = 0xE9; }
-    else if (c.freq_hz >= 863000000) { img[0] = 0xD7; img[1] = 0xDB; }
-    else if (c.freq_hz >= 779000000) { img[0] = 0xC1; img[1] = 0xC5; }
-    else if (c.freq_hz >= 470000000) { img[0] = 0x75; img[1] = 0x81; }
-    else                             { img[0] = 0x6B; img[1] = 0x6F; }
+    image_cal_band(c.freq_hz, img);
     BAIL_NOTE(cmd(CMD_CALIBRATE_IMAGE, img, sizeof(img)));
 
-    uint8_t duty, hp_max;
-    pa_tier_for(c.tx_dbm, &duty, &hp_max);
-    const uint8_t pa[4] = { duty, hp_max, 0x00 /* SX1262 */, 0x01 };
+    const uint8_t pa[4] = { PA_DUTY_CYCLE, PA_HP_MAX, 0x00 /* SX1262 */, 0x01 };
     BAIL_NOTE(cmd(CMD_SET_PA_CONFIG, pa, sizeof(pa)));
 
     // SetPaConfig resets OCP; put it back to 140 mA so the HP PA is not current
@@ -785,7 +786,7 @@ static esp_err_t set_payload_len(uint8_t len)
 
 esp_err_t sx126x_tx(const uint8_t *buf, uint8_t len, uint32_t timeout_ms)
 {
-    if (!s_ready) {
+    if (!ready_or_note()) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -797,17 +798,9 @@ esp_err_t sx126x_tx(const uint8_t *buf, uint8_t len, uint32_t timeout_ms)
     BAIL_NOTE(set_payload_len(len));
     BAIL_NOTE(buf_write(0, buf, len));
 
-    rf_switch(true);
-
     const uint32_t steps = timeout_steps(timeout_ms);
     const uint8_t p[3] = { (uint8_t)(steps >> 16), (uint8_t)(steps >> 8), (uint8_t)steps };
-    const esp_err_t tx_err = cmd(CMD_SET_TX, p, sizeof(p));
-    if (tx_err != ESP_OK) {
-        rf_switch(false);  // don't leave the antenna switch armed for a TX that never started
-        unlock();
-        note_result(false);
-        return tx_err;
-    }
+    BAIL_NOTE(cmd(CMD_SET_TX, p, sizeof(p)));
     unlock();
 
     // Wait off-lock so the HTTP task can still read cached state. A little slack
@@ -823,7 +816,6 @@ esp_err_t sx126x_tx(const uint8_t *buf, uint8_t len, uint32_t timeout_ms)
         log_diagnostics("TX");
     }
     clear_irq(0xFFFF);
-    rf_switch(false);
     set_standby();
     unlock();
 
@@ -833,7 +825,7 @@ esp_err_t sx126x_tx(const uint8_t *buf, uint8_t len, uint32_t timeout_ms)
 
 esp_err_t sx126x_rx_start(uint32_t timeout_ms)
 {
-    if (!s_ready) {
+    if (!ready_or_note()) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -842,14 +834,38 @@ esp_err_t sx126x_rx_start(uint32_t timeout_ms)
     BAIL_NOTE(clear_irq(0xFFFF));
     BAIL_NOTE(set_payload_len(0xFF));  // explicit header: accept any length
 
-    rf_switch(false);
-
     const uint32_t steps = (timeout_ms == 0) ? RX_CONTINUOUS : timeout_steps(timeout_ms);
     const uint8_t p[3] = { (uint8_t)(steps >> 16), (uint8_t)(steps >> 8), (uint8_t)steps };
     esp_err_t err = cmd(CMD_SET_RX, p, sizeof(p));
     unlock();
     note_result(err == ESP_OK);
     return err;
+}
+
+// RssiPkt-style fields hold -dBm * 2. A raw 0 is the top of the scale (front end
+// saturated) and would otherwise come out as -0.0, which prints as "-0".
+static float rssi_from_raw(uint8_t raw)
+{
+    return raw ? -(float)raw / 2.0f : 0.0f;
+}
+
+// Carrier offset of the last received packet relative to this radio, in Hz: a
+// 20-bit two's-complement count scaled by bandwidth. On a crystal-clocked module
+// like the Ra-01SH this shows how far apart the two boards' carriers sit; LoRa
+// stops decoding at roughly a quarter of the bandwidth. Lock must be held.
+static float read_freq_error_hz(void)
+{
+    uint8_t raw[3] = { 0 };
+    for (int i = 0; i < 3; i++) {
+        if (reg_read(REG_FREQ_ERROR + i, &raw[i]) != ESP_OK) {
+            return 0.0f;
+        }
+    }
+    int32_t efe = (int32_t)((((uint32_t)raw[0] << 16) | ((uint32_t)raw[1] << 8) | raw[2]) & 0x0FFFFF);
+    if (efe & 0x80000) {
+        efe -= 0x100000;  // sign-extend the 20-bit field
+    }
+    return 1.55f * (float)efe * ((float)sx126x_bw_hz(s_cfg.bw) / 1000.0f) / 1600.0f;
 }
 
 int sx126x_rx_poll(uint8_t *buf, uint8_t max_len, sx126x_rxinfo_t *info)
@@ -885,9 +901,10 @@ int sx126x_rx_poll(uint8_t *buf, uint8_t max_len, sx126x_rxinfo_t *info)
     if (info != NULL) {
         uint8_t ps[4] = { 0 };
         xfer(CMD_GET_PACKET_STATUS, NULL, ps, sizeof(ps));
-        info->rssi        = -((float)ps[1]) / 2.0f;
+        info->rssi        = rssi_from_raw(ps[1]);
         info->snr         = ((float)(int8_t)ps[2]) / 4.0f;
-        info->signal_rssi = -((float)ps[3]) / 2.0f;
+        info->signal_rssi = rssi_from_raw(ps[3]);
+        info->freq_err_hz = read_freq_error_hz();
         info->len         = len;
     }
 
@@ -944,13 +961,12 @@ float sx126x_rssi_inst(void)
     if (err != ESP_OK) {
         return 0.0f;
     }
-    return -((float)r[1]) / 2.0f;
+    return rssi_from_raw(r[1]);
 }
 
 esp_err_t sx126x_standby(void)
 {
     lock();
-    rf_switch(false);
     esp_err_t err = set_standby();
     unlock();
     return err;
@@ -960,7 +976,6 @@ esp_err_t sx126x_sleep(void)
 {
     const uint8_t p = 0x04;  // warm start, retain configuration
     lock();
-    rf_switch(false);
     esp_err_t err = cmd(CMD_SET_SLEEP, &p, 1);
     unlock();
     return err;

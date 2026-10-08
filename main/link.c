@@ -101,7 +101,7 @@ bool link_cfg_valid(const sx126x_cfg_t *cfg)
            cfg->freq_hz >= LINK_FREQ_MIN_HZ && cfg->freq_hz <= LINK_FREQ_MAX_HZ &&
            cfg->sf >= 5 && cfg->sf <= 12 &&
            cfg->cr >= 5 && cfg->cr <= 8 &&
-           cfg->preamble >= 6 &&
+           cfg->preamble >= 1 &&
            cfg->tx_dbm >= -9 && cfg->tx_dbm <= 22;
 }
 
@@ -136,8 +136,19 @@ static void load_from_nvs(void)
     link_cfg_wire_t w;
     size_t sz = sizeof(w);
     if (nvs_get_blob(h, NVS_KEY_CFG, &w, &sz) == ESP_OK && sz == sizeof(w)) {
-        link_cfg_from_wire(&w, &s_cfg);
-        ESP_LOGI(TAG, "Loaded radio profile from NVS");
+        sx126x_cfg_t saved;
+        link_cfg_from_wire(&w, &saved);
+        // Checked like a profile arriving over the air. NVS survives reflashing, so
+        // a blob left by another build, or a corrupted one, must not reach the
+        // radio unchecked.
+        if (link_cfg_valid(&saved)) {
+            s_cfg = saved;
+            ESP_LOGI(TAG, "Loaded radio profile from NVS");
+        } else {
+            ESP_LOGW(TAG, "Saved radio profile (%lu Hz SF%u) is outside what this radio "
+                          "supports; using the build defaults",
+                     (unsigned long)saved.freq_hz, saved.sf);
+        }
     }
 
     uint8_t m = 0;
@@ -151,7 +162,10 @@ esp_err_t link_persist_cfg(void)
 {
     lock();
     link_cfg_wire_t w;
-    link_cfg_to_wire(&s_cfg, &w);
+    // While a profile is provisional, NVS keeps the one it would revert to, so a
+    // reset in that window comes back on the last proven profile. Without this a
+    // mode change mid-window (which persists too) saved the untested profile.
+    link_cfg_to_wire(s_prov ? &s_prov_fallback : &s_cfg, &w);
     const uint8_t m = (uint8_t)s_mode;
     unlock();
 
@@ -236,6 +250,61 @@ const char *link_mode_str(link_mode_t mode)
     return (mode == LINK_MODE_BATTERY) ? "battery" : "range";
 }
 
+const char *link_cmd_name(uint8_t op)
+{
+    switch (op) {
+        case LINK_CMD_STATUS:         return "status";
+        case LINK_CMD_RUN:            return "run";
+        case LINK_CMD_MODE:           return "mode";
+        case LINK_CMD_INTERVAL:       return "interval";
+        case LINK_CMD_PAYLOAD:        return "payload";
+        case LINK_CMD_RESET_COUNTERS: return "reset counters";
+        case LINK_CMD_PUSH_CFG:       return "push profile";
+        case LINK_CMD_LOAD:           return "max drain";
+        case LINK_CMD_RESET_CLOCK:    return "reset discharge clock";
+        case LINK_CMD_CALIBRATE:      return "calibrate";
+        case LINK_CMD_RATIO_RESET:    return "reset ratio";
+        case LINK_CMD_WIFI_OFF:       return "WiFi off";
+        case LINK_CMD_REBOOT:         return "reboot";
+        default:                      return "unknown";
+    }
+}
+
+void link_cmd_describe(const link_cmd_t *c, char *out, size_t n)
+{
+    const unsigned long arg = c->arg;
+    switch (c->op) {
+        case LINK_CMD_RUN:
+            snprintf(out, n, "%s", arg ? "start" : "stop");
+            break;
+        case LINK_CMD_MODE:
+            snprintf(out, n, "%s test", arg == LINK_MODE_BATTERY ? "battery" : "range");
+            break;
+        case LINK_CMD_INTERVAL:
+            snprintf(out, n, "interval %lu ms", arg);
+            break;
+        case LINK_CMD_PAYLOAD:
+            snprintf(out, n, "payload %lu B", arg);
+            break;
+        case LINK_CMD_LOAD:
+            snprintf(out, n, "max drain %s", arg ? "on" : "off");
+            break;
+        case LINK_CMD_CALIBRATE:
+            snprintf(out, n, "calibrate to %lu.%03lu V", arg / 1000, arg % 1000);
+            break;
+        case LINK_CMD_PUSH_CFG: {
+            sx126x_cfg_t cfg;
+            link_cfg_from_wire(&c->cfg, &cfg);
+            snprintf(out, n, "push SF%u BW%lu CR4/%u %+d dBm %.4f MHz", cfg.sf,
+                     (unsigned long)sx126x_bw_hz(cfg.bw), cfg.cr, cfg.tx_dbm, cfg.freq_hz / 1e6);
+            break;
+        }
+        default:
+            snprintf(out, n, "%s", link_cmd_name(c->op));
+            break;
+    }
+}
+
 // --------------------------------------------------------- apply queueing ----
 
 esp_err_t link_request_apply(const sx126x_cfg_t *cfg, bool persist)
@@ -246,6 +315,14 @@ esp_err_t link_request_apply(const sx126x_cfg_t *cfg, bool persist)
     s_apply_req     = true;
     unlock();
     return ESP_OK;
+}
+
+bool link_apply_queued(void)
+{
+    lock();
+    const bool q = s_apply_req;
+    unlock();
+    return q;
 }
 
 bool link_apply_pending(void)
@@ -330,14 +407,14 @@ uint32_t link_profile_revert_in_s(void)
     return (left <= 0) ? 0 : (uint32_t)(left / 1000000) + 1;
 }
 
-void link_profile_tick(void)
+bool link_profile_tick(void)
 {
     const int64_t now = esp_timer_get_time();
 
     lock();
     if (!s_prov) {
         unlock();
-        return;
+        return false;
     }
     const uint32_t silence_s = s_prov_silence_s;
     const uint32_t commit_s  = silence_s * LINK_PROV_COMMIT_MULTIPLE;
@@ -355,16 +432,17 @@ void link_profile_tick(void)
                  (unsigned)silence_s);
         sx126x_apply(&revert);
         link_persist_cfg();
-        return;
+        return true;
     }
     if (proven) {
         s_prov = false;
         unlock();
         ESP_LOGI(TAG, "Profile carried traffic for %us; committing", (unsigned)commit_s);
         link_persist_cfg();
-        return;
+        return false;
     }
     unlock();
+    return false;
 }
 
 // ------------------------------------------------------------------ json ----

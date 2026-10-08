@@ -50,8 +50,12 @@
     padding:7px 12px; font-size:.85rem; cursor:pointer; text-decoration:none; display:inline-block;
   }
   button:hover, a.btn:hover { background:#2b3f63; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
   .danger { background:#3a1a1a; border-color:#7a2b2b; }
   .danger:hover { background:#4a2020; }
+  button.cur { border-color:var(--good); box-shadow:inset 0 0 0 1px var(--good); }
+  .btns { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }
+  .panel h3 { margin:16px 0 8px; }
   .derived { color:var(--muted); font-size:.8rem; margin-top:10px; line-height:1.6; }
   .derived b { color:var(--ink); font-weight:600; font-variant-numeric:tabular-nums; }
   .warn { color:var(--warning); } .bad { color:var(--critical); } .ok { color:var(--good); }
@@ -129,18 +133,84 @@
 
   <div class="panel">
     <div class="row">
+      <h2>Sender control</h2>
+      <div>
+        <button id="rcRefresh">Refresh</button>
+        <button id="rcCancel">Cancel waiting</button>
+      </div>
+    </div>
+    <div class="derived" style="margin-top:0">Everything the sender's own dashboard does, over
+      LoRa. Commands queue here and ride on this board's acknowledgements, so each reaches the
+      sender with its next packet, or at its next check-in while it is stopped.</div>
+    <div class="derived" id="rcLink"></div>
+    <div class="derived" id="rcSettings"></div>
+    <div class="derived" id="rcQueue"></div>
+
+    <h3>Test</h3>
+    <div class="btns">
+      <button id="rcStart">Start</button>
+      <button id="rcStop">Stop</button>
+      <button id="rcRange">Range test</button>
+      <button id="rcBattery">Battery test</button>
+      <button id="rcReset">Reset sender counters</button>
+    </div>
+    <div class="fields">
+      <div>
+        <label class="f" for="rcInterval">Interval (ms, 0 = back-to-back)</label>
+        <input id="rcInterval" type="number" min="0" max="600000" step="100">
+      </div>
+      <div style="align-self:end"><button id="rcIntervalBtn">Set interval</button></div>
+      <div>
+        <label class="f" for="rcSize">Payload (bytes)</label>
+        <input id="rcSize" type="number" min="17" max="255">
+      </div>
+      <div style="align-self:end"><button id="rcSizeBtn">Set payload</button></div>
+    </div>
+
+    <h3>Battery</h3>
+    <div class="btns">
+      <button id="rcDrainOn">Max drain on</button>
+      <button id="rcDrainOff">Max drain off</button>
+      <button id="rcClock" class="danger">Reset discharge clock</button>
+    </div>
+    <div class="fields">
+      <div>
+        <label class="f" for="rcCalV">Sender's battery, multimeter (V)</label>
+        <input id="rcCalV" type="number" min="0.5" max="30" step="0.001" placeholder="e.g. 4.16">
+      </div>
+      <div style="align-self:end">
+        <button id="rcCal">Calibrate</button>
+        <button id="rcCalReset">Reset ratio</button>
+      </div>
+    </div>
+
+    <h3>Device</h3>
+    <div class="btns">
+      <button id="rcWifiOff" class="danger">Turn sender WiFi off</button>
+      <button id="rcReboot" class="danger">Reboot sender</button>
+    </div>
+    <div class="derived" id="rcNote"></div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
       <h2>Radio profile</h2>
-      <div><button id="applyLocal">Apply</button></div>
+      <div>
+        <button id="applyLocal">Apply here only</button>
+        <button id="pushBoth">Push to both</button>
+      </div>
     </div>
     <div class="fields">
       <div><label class="f" for="sf">Spreading factor</label><select id="sf"></select></div>
       <div><label class="f" for="bw">Bandwidth (Hz)</label><select id="bw"></select></div>
       <div><label class="f" for="cr">Coding rate</label><select id="cr"></select></div>
-      <div><label class="f" for="pre">Preamble (symbols)</label><input id="pre" type="number" min="6" max="65535"></div>
+      <div><label class="f" for="pre">Preamble (symbols)</label><input id="pre" type="number" min="1" max="65535"></div>
       <div><label class="f" for="pwr">TX power (dBm)</label><input id="pwr" type="number" min="-9" max="22"></div>
-      <div><label class="f" for="freq">Frequency (Hz)</label><input id="freq" type="number" min="803000000" max="930000000" step="100"></div>
+      <div><label class="f" for="freq">Frequency (Hz)</label><input id="freq" type="number" min="150000000" max="960000000" step="1"></div>
     </div>
     <div class="derived" id="calc"></div>
+    <div class="derived" id="applyState"></div>
+    <div class="derived" id="pushState"></div>
   </div>
 
   <div class="panel">
@@ -153,6 +223,11 @@
     </div>
     <div class="cards" style="margin-bottom:14px">
       <div class="card">
+        <div class="label">Battery</div>
+        <div class="value"><span id="battV">–</span> <small>V</small></div>
+        <div class="note">sense pin × <span id="ratio">–</span>, the sender's calibration</div>
+      </div>
+      <div class="card">
         <div class="label">Sense pin</div>
         <div class="value"><span id="pinMv">–</span> <small>mV</small></div>
         <div class="note">as measured, no divider</div>
@@ -161,6 +236,16 @@
         <div class="label">Sender uptime</div>
         <div class="value" id="battUptime" style="font-size:1.25rem">–</div>
         <div class="note">discharge clock</div>
+      </div>
+      <div class="card">
+        <div class="label">Sender's solar charging</div>
+        <div class="value" id="chargePeer" style="font-size:1.05rem">–</div>
+        <div class="note">reported in every packet</div>
+      </div>
+      <div class="card">
+        <div class="label">This board's solar charging</div>
+        <div class="value" id="chargeSelf" style="font-size:1.05rem">–</div>
+        <div class="note">receiver</div>
       </div>
     </div>
     <canvas id="vChart"></canvas>
@@ -175,8 +260,17 @@
     <div class="tablewrap">
       <table>
         <thead><tr>
-          <th class="l">Seq</th><th class="l">Type</th><th>Bytes</th><th>RSSI</th>
-          <th>SNR</th><th>Signal RSSI</th><th>Missed before</th>
+          <th class="l">Seq</th><th class="l">Type</th><th>Bytes</th>
+          <th title="packet RSSI, dBm">RSSI</th><th title="signal RSSI after despreading, dBm">Sig</th>
+          <th title="dB">SNR</th><th title="dB above the lowest SNR this SF decodes">SNR margin</th>
+          <th title="dB above the estimated sensitivity">Fade margin</th>
+          <th title="TX power minus signal RSSI, dB">Path loss</th>
+          <th title="carrier offset between the boards">Freq err Hz</th>
+          <th title="idle-channel RSSI, dBm">Noise</th><th title="packets missed just before this one">Gap</th>
+          <th title="delivery ratio so far">PDR %</th><th>Lost</th><th>Dup</th>
+          <th title="out of order">OOO</th><th title="CRC errors">CRC</th><th title="header errors">Hdr</th>
+          <th title="battery packets: the sender's battery">Battery V</th>
+          <th class="l" title="the sender's solar charger">Sender charging</th>
         </tr></thead>
         <tbody id="logBody"></tbody>
       </table>
@@ -210,7 +304,8 @@ function airtimeMs(sf, bwHz, cr, preamble, crc, len) {
   const de = tsym > 16 ? 1 : 0;
   const nPre = preamble + (sf < 7 ? 6.25 : 4.25);
   const den = (sf < 7) ? (4 * sf) : (4 * (sf - 2 * de));
-  const num = 8 * len - 4 * sf + 28 + 16 * (crc ? 1 : 0);
+  // +8 only for SF7-12; +20 for the explicit header.
+  const num = 8 * len + 16 * (crc ? 1 : 0) - 4 * sf + (sf < 7 ? 0 : 8) + 20;
   return (nPre + 8 + Math.max(Math.ceil(num / den), 0) * cr) * tsym;
 }
 function sensitivityDbm(sf, bwHz) { return -174 + 10 * Math.log10(bwHz) + 6 + (-2.5 * (sf - 4)); }
@@ -230,8 +325,17 @@ const BW_LIST = [7810, 10420, 15630, 20830, 31250, 41670, 62500, 125000, 250000,
 
 /* ---- radio form ---- */
 let touched = false;
+let awaiting = false;  // an Apply the radio has not taken yet
+let pushWant = null;   // a Push to both this board is not on yet
+let pushIdleSince = 0;
 ["sf", "bw", "cr", "pre", "pwr", "freq"].forEach(id =>
   $(id).addEventListener("input", () => { touched = true; recalc(); }));
+
+function formCfg() {
+  return { sf: +$("sf").value, bw: +$("bw").value, cr: +$("cr").value,
+           pre: +$("pre").value, pwr: +$("pwr").value, freq: +$("freq").value };
+}
+const cfgQuery = c => `sf=${c.sf}&bw=${c.bw}&cr=${c.cr}&pre=${c.pre}&pwr=${c.pwr}&freq=${c.freq}`;
 
 function recalc() {
   const sf = +$("sf").value, bw = +$("bw").value, cr = +$("cr").value;
@@ -253,13 +357,21 @@ function loadForm(d) {
 }
 
 $("applyLocal").onclick = async () => {
-  if (!confirm("Apply this profile?\n\nThe sender must already be using it, or the link " +
-               "stays down until you change the sender to match.")) return;
-  const q = `sf=${+$("sf").value}&bw=${+$("bw").value}&cr=${+$("cr").value}` +
-            `&pre=${+$("pre").value}&pwr=${+$("pwr").value}&freq=${+$("freq").value}`;
-  const r = await fetch("/radio?" + q, { cache: "no-store" });
+  if (!confirm("Apply here only?\n\nThis changes the receiver and nothing else, so the link " +
+               "stays down until the sender matches. \"Push to both\" changes both — use this " +
+               "only to recover an already-broken link.")) return;
+  const r = await fetch("/radio?" + cfgQuery(formCfg()), { cache: "no-store" });
   if (!r.ok) { alert("Rejected: " + await r.text()); return; }
-  touched = false; pollStatus();
+  awaiting = true; pollStatus();
+};
+
+// Sent to the sender as a command; it then pushes the profile back to this board as
+// it would from its own dashboard, provisionally, so both revert if it carries nothing.
+$("pushBoth").onclick = async () => {
+  const c = formCfg();
+  if (await senderCmd("op=push&confirm=1&" + cfgQuery(c))) {
+    pushWant = c; pushIdleSince = 0; touched = true;
+  }
 };
 
 $("resetBtn").onclick = async () => {
@@ -275,7 +387,7 @@ $("clearLogs").onclick = async () => {
   if (!confirm("Clear the entire battery log? This cannot be undone.")) return;
   const r = await fetch("/clear?confirm=1", { cache: "no-store" });
   if (!r.ok) { alert("Failed to clear the log."); return; }
-  vData = []; lastPlotted = -1; renderV();
+  vData = []; lastPlotted = -1; vEarlier = 0; vChart.set([]);
 };
 
 /* ---- status ---- */
@@ -301,13 +413,48 @@ async function pollStatus() {
   $("crcErr").textContent = d.crc_err;
   $("hdrErr").textContent = d.hdr_err;
 
+  curRatio = d.ratio;
+  $("chargeSelf").textContent = d.charge;
+  $("chargePeer").textContent = d.peer_charge === "Unknown" ? "not heard from yet" : d.peer_charge;
   if (d.have_batt) {
     $("pinMv").textContent = d.pin_mv;
+    $("battV").textContent = d.ratio > 0 ? (d.batt_mv / 1000).toFixed(2) : "–";
+    $("ratio").textContent = d.ratio > 0 ? d.ratio.toFixed(3) : "–";
     $("battUptime").textContent = fmtUptime(d.batt_uptime_s);
-    if (d.batt_uptime_s > lastPlotted) loadChart();
+    // Reload on any new sample, not only a later one: after the sender's discharge
+    // clock is reset every new sample is earlier than the last one plotted, and a
+    // greater-than test froze the chart. A recalibration redraws it in new volts.
+    if (d.batt_uptime_s !== lastPlotted || d.ratio !== plottedRatio) loadChart();
   }
 
+  // Hold the form on the values just applied until the radio has them; reloading
+  // at once showed the old profile and looked like the button had failed.
+  if (awaiting && !d.apply_pending) { awaiting = false; if (!pushWant) touched = false; }
+  // A push reaches this board only after a trip through the sender, so hold the form
+  // until this board is on the pushed profile - or, if it never gets there (refused,
+  // cancelled, or the sender's CFG frame lost), a while after nothing is waiting.
+  if (pushWant) {
+    const live = d.sf === pushWant.sf && d.bw_hz === pushWant.bw && d.cr === pushWant.cr &&
+                 d.preamble === pushWant.pre && d.tx_dbm === pushWant.pwr && d.freq_hz === pushWant.freq;
+    if (live || (!d.cmd_queued && pushIdleSince && Date.now() - pushIdleSince > 20000)) {
+      pushWant = null;
+      if (!awaiting) touched = false;
+    } else if (d.cmd_queued) {
+      pushIdleSince = 0;
+    } else if (!pushIdleSince) {
+      pushIdleSince = Date.now();
+    }
+  }
   loadForm(d);
+  $("applyLocal").disabled = d.apply_pending;
+  $("applyState").textContent = d.apply_pending ? "Applying…" : "";
+  $("pushBoth").disabled = !!pushWant;
+  $("pushBoth").textContent = pushWant ? "Pushing…" : "Push to both";
+  $("pushState").textContent = pushWant
+    ? "Push to both: the sender takes the command, then sends this board the new profile " +
+      "and both switch together." : "";
+
+  renderSenderControl(d);
 
   const banner = $("rollbackBanner");
   if (d.rollback_pending) {
@@ -321,6 +468,141 @@ async function pollStatus() {
   loadLog();
 }
 
+/* ---- sender control, over LoRa ----
+   Nothing here reaches the sender directly: /sendercmd queues a command on this
+   board, and it goes out on the acknowledgement for the sender's next packet, or for
+   its next check-in while stopped. Its answer brings its settings back. */
+let rcAsked = false;   // asked the sender for its settings, once per page load
+let rcWhen = "";       // when the next command can get through, for the queued note
+
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const ago = s => s < 90 ? s + " s ago" : s < 5400 ? Math.round(s / 60) + " min ago" : (s / 3600).toFixed(1) + " h ago";
+const span = ms => ms < 1000 ? ms + " ms" : +(ms / 1000).toFixed(1) + " s";
+
+// Mirrors the sender's poll_period_ms(): every 5 s, but never more than a tenth of the
+// time on air, so a check-in comes round far less often at SF12.
+const pollEveryMs = d => Math.max(5000, 10 * airtimeMs(d.sf, d.bw_hz, d.cr, d.preamble, d.crc, 10));
+
+function rcNote(html, fades) {
+  $("rcNote").innerHTML = html;
+  clearTimeout(rcNote.timer);
+  if (fades) rcNote.timer = setTimeout(() => { $("rcNote").textContent = ""; }, 8000);
+}
+
+async function senderCmd(q) {
+  let r;
+  try { r = await fetch("/sendercmd?" + q, { cache: "no-store" }); }
+  catch (e) { rcNote(`<span class="bad">Not queued: this board did not answer.</span>`); return false; }
+  if (!r.ok) { rcNote(`<span class="bad">Rejected: ${esc(await r.text())}</span>`); return false; }
+  rcNote(`<span class="ok">Queued.</span> ${esc(rcWhen)}`, true);
+  pollStatus();
+  return true;
+}
+
+function renderSenderControl(d) {
+  // Whether it is running comes from the last frame heard, fresher than its settings.
+  const running = d.contact_seen ? !d.sender_stopped : d.sender_known ? d.sender_running : null;
+  const iv = d.sender_known ? d.sender_interval_ms : null;
+  rcWhen = !d.contact_seen
+    ? "Nothing heard from the sender since this board started: commands wait until it is in range."
+    : !running
+      ? `It is stopped and checks in every ${span(Math.round(pollEveryMs(d)))}; commands go out then.`
+      : "It is running; commands go out with its next packet" +
+        (iv === null ? "." : iv === 0 ? " (back-to-back)." : ` (every ${span(iv)}).`);
+  $("rcLink").innerHTML = (d.contact_seen ? `Sender last heard <b>${ago(d.contact_age_s)}</b>. ` : "") + esc(rcWhen);
+
+  $("rcSettings").innerHTML = d.sender_known
+    ? `Its settings, reported ${ago(d.sender_age_s)}: <b>${d.sender_running ? "running" : "stopped"}</b> · ` +
+      `<b>${d.sender_mode}</b> test · <b>${d.sender_interval_ms === 0 ? "back-to-back" : "every " + span(d.sender_interval_ms)}</b> · ` +
+      `<b>${d.sender_payload} B</b> · max drain <b>${d.sender_load ? "on" : "off"}</b> · ` +
+      `WiFi <b>${d.sender_wifi ? "on" : "off"}</b> · divider ratio <b>${d.sender_ratio.toFixed(3)}</b>`
+    : "Its settings arrive with its answer to the first command.";
+
+  $("rcQueue").innerHTML =
+    (d.cmd_queued
+      ? `Waiting for the sender: <b>${esc(d.cmd_waiting)}</b>` +
+        (d.cmd_queued > 1 ? `, then ${d.cmd_queued - 1} more` : "")
+      : "Nothing waiting.") +
+    (d.cmd_state ? ` · Last: ${esc(d.cmd_state)}` : "");
+  $("rcCancel").disabled = !d.cmd_queued;
+
+  // Mark what is in force, as far as this board knows.
+  const cur = (id, on) => $(id).classList.toggle("cur", on === true);
+  cur("rcStart", running === true);
+  cur("rcStop", running === false);
+  const modeKnown = d.contact_seen || d.sender_known;  // this board's mode follows the sender's
+  cur("rcRange", modeKnown && d.mode === "range");
+  cur("rcBattery", modeKnown && d.mode === "battery");
+  cur("rcDrainOn", d.sender_known && d.sender_load);
+  cur("rcDrainOff", d.sender_known && !d.sender_load);
+  $("rcInterval").placeholder = d.sender_known ? "now " + d.sender_interval_ms : "";
+  $("rcSize").placeholder = d.sender_known ? "now " + d.sender_payload : "";
+
+  // Ask for its settings once, so the panel has something to show.
+  if (!d.sender_known && !d.cmd_queued && !rcAsked) {
+    rcAsked = true;
+    fetch("/sendercmd?op=status", { cache: "no-store" }).catch(() => {});
+  }
+}
+
+$("rcRefresh").onclick = () => senderCmd("op=status");
+$("rcCancel").onclick = async () => {
+  try { await fetch("/sendercmd?op=cancel", { cache: "no-store" }); }
+  catch (e) { rcNote(`<span class="bad">This board did not answer.</span>`); return; }
+  rcNote("Cancelled what was still waiting. One already delivered may have been carried out.", true);
+  pollStatus();
+};
+$("rcStart").onclick = () => senderCmd("op=run&on=1");
+$("rcStop").onclick = () => senderCmd("op=run&on=0");
+$("rcRange").onclick = () => senderCmd("op=mode&m=range");
+$("rcBattery").onclick = () => senderCmd("op=mode&m=battery");
+$("rcReset").onclick = () => senderCmd("op=reset");
+$("rcDrainOn").onclick = () => senderCmd("op=load&on=1");
+$("rcDrainOff").onclick = () => senderCmd("op=load&on=0");
+
+// Never from an empty box: it reads as 0, and an interval of 0 is back-to-back at
+// full drain.
+$("rcIntervalBtn").onclick = async () => {
+  const raw = $("rcInterval").value.trim();
+  if (raw === "") { rcNote(`<span class="bad">Enter an interval in ms.</span>`); return; }
+  if (await senderCmd("op=interval&ms=" + Math.round(+raw))) $("rcInterval").value = "";
+};
+$("rcSizeBtn").onclick = async () => {
+  const raw = $("rcSize").value.trim();
+  if (raw === "") { rcNote(`<span class="bad">Enter a payload size in bytes.</span>`); return; }
+  if (await senderCmd("op=payload&size=" + Math.round(+raw))) $("rcSize").value = "";
+};
+
+// The sender works the ratio out from its own sense pin when the command lands, so
+// measure its battery as it is now.
+$("rcCal").onclick = async () => {
+  const v = parseFloat($("rcCalV").value);
+  if (!(v >= 0.5 && v <= 30)) {
+    rcNote(`<span class="bad">Enter the sender's battery voltage from a multimeter, e.g. 4.16.</span>`);
+    return;
+  }
+  if (await senderCmd("op=calibrate&actual_mv=" + Math.round(v * 1000))) $("rcCalV").value = "";
+};
+$("rcCalReset").onclick = () => {
+  if (!confirm("Forget the sender's calibration and go back to its default divider ratio?")) return;
+  senderCmd("op=ratio_reset");
+};
+$("rcClock").onclick = () => {
+  if (!confirm("Reset the sender's discharge clock to zero?\n\nThe battery graph starts a new run; " +
+               "the CSV keeps the old one.")) return;
+  senderCmd("op=clock_reset");
+};
+$("rcWifiOff").onclick = () => {
+  if (!confirm("Turn the sender's WiFi off?\n\nIts own dashboard becomes unreachable until it " +
+               "reboots. You can still reboot it from here.")) return;
+  senderCmd("op=wifi_off&confirm=1");
+};
+$("rcReboot").onclick = () => {
+  if (!confirm("Reboot the sender?\n\nIt comes back running, carrying on its sequence numbers " +
+               "and discharge clock.")) return;
+  senderCmd("op=reboot&confirm=1");
+};
+
 /* ---- packet log + RSSI chart ---- */
 let rows = [], cursor = 0;
 
@@ -328,6 +610,9 @@ async function loadLog() {
   let d;
   try { d = await (await fetch("/log?since=" + cursor, { cache: "no-store" })).json(); }
   catch (e) { return; }
+  // The board restarted, so its log began again from 0. Asking from the old
+  // cursor skipped the first packets after every reboot; ask again from the top.
+  if (d.next < cursor) { cursor = 0; return loadLog(); }
   if (!d.entries.length && cursor === d.next) return;
   cursor = d.next;
   rows = rows.concat(d.entries).slice(-MAX_ROWS);
@@ -336,7 +621,11 @@ async function loadLog() {
 }
 
 const TYPE_NAME = { 1: "ping", 2: "ack", 3: "battery", 4: "config", 5: "config ack" };
+// The sender's charger state as each packet carried it (charge_state_t).
+const CHARGE_NAME = { 0: "Not charging", 1: "Charging (solar)", 2: "Charge complete" };
+const signed = (v, dp) => (v >= 0 ? "+" : "") + v.toFixed(dp);
 
+// The same figures, in the same order, as the receiver's console line.
 function renderLog() {
   const body = $("logBody");
   if (!rows.length) {
@@ -350,9 +639,22 @@ function renderLog() {
       <td class="l">${TYPE_NAME[e.type] || e.type}</td>
       <td>${e.len}</td>
       <td>${e.rssi.toFixed(0)}</td>
-      <td>${e.snr.toFixed(1)}</td>
       <td>${e.signal_rssi.toFixed(0)}</td>
+      <td>${e.snr.toFixed(1)}</td>
+      <td>${signed(e.snr_margin, 1)}</td>
+      <td>${signed(e.fade_margin, 1)}</td>
+      <td>${e.path_loss.toFixed(0)}</td>
+      <td>${signed(e.freq_err, 0)}</td>
+      <td>${e.noise_floor ? e.noise_floor.toFixed(0) : "–"}</td>
       <td>${e.gap || "–"}</td>
+      <td>${e.pdr.toFixed(1)}</td>
+      <td>${e.lost}</td>
+      <td>${e.dup}</td>
+      <td>${e.out_of_order}</td>
+      <td>${e.crc_err}</td>
+      <td>${e.hdr_err}</td>
+      <td>${e.batt_mv ? (e.batt_mv / 1000).toFixed(2) : "–"}</td>
+      <td class="l">${CHARGE_NAME[e.charge] || "–"}</td>
     </tr>`).join("");
   const missed = rows.reduce((a, e) => a + e.gap, 0);
   $("logInfo").textContent =
@@ -364,6 +666,7 @@ function renderLog() {
    share a scale, and overlaying them would misrepresent both. */
 function makeChart(canvasId, infoId, opts) {
   const canvas = $(canvasId);
+  const infoEmpty = $(infoId).textContent;  // the footer's text before any data
   let ctx, dpr = 1, cssW = 0, cssH = 0, plot = null, hoverIdx = -1, data = [];
 
   function setup() {
@@ -392,6 +695,8 @@ function makeChart(canvasId, infoId, opts) {
       ctx.fillStyle = C("--muted"); ctx.font = "14px system-ui, sans-serif";
       ctx.textAlign = "center"; ctx.textBaseline = "middle";
       ctx.fillText(opts.empty, cssW / 2, cssH / 2);
+      // Reset the footer too, or a cleared chart kept the old "N points" line.
+      $(infoId).textContent = infoEmpty;
       return;
     }
 
@@ -433,7 +738,8 @@ function makeChart(canvasId, infoId, opts) {
     ctx.fillText(opts.xLabel, padL + plotW / 2, cssH);
     ctx.save();
     ctx.translate(12, padT + plotH / 2); ctx.rotate(-Math.PI / 2);
-    ctx.textBaseline = "top"; ctx.fillText(opts.yLabel, 0, 0);
+    ctx.textBaseline = "top";
+    ctx.fillText(typeof opts.yLabel === "function" ? opts.yLabel() : opts.yLabel, 0, 0);
     ctx.restore();
 
     const pts = data.map(d => ({ px: sx(d.x), py: sy(d.y), d }));
@@ -512,15 +818,18 @@ const rssiChart = makeChart("rssiChart", "rssiInfo", {
   info: d => `${d.length} packets · latest ${d[d.length - 1].y.toFixed(0)} dBm`,
 });
 
+// Battery volts once the sender's divider ratio is known, sense-pin mV until then.
+const vLabel = d => vVolts ? d.y.toFixed(2) + " V" : d.y.toFixed(0) + " mV";
 const vChart = makeChart("vChart", "chartInfo", {
   color: "--series-1",
-  xLabel: "sender uptime", yLabel: "sense pin (mV)",
+  xLabel: "sender uptime", yLabel: () => vVolts ? "battery (V)" : "sense pin (mV)",
   empty: "No data yet — points appear as the sender reports battery telemetry.",
   fmtX: v => v >= 7200 ? (v / 3600).toFixed(1) + "h" : Math.round(v / 60) + "m",
-  fmtY: v => v.toFixed(0),
-  tooltip: d => ["uptime  " + fmtUptime(d.x), "pin  " + d.y.toFixed(0) + " mV",
+  fmtY: v => vVolts ? v.toFixed(2) : v.toFixed(0),
+  tooltip: d => ["uptime  " + fmtUptime(d.x), "battery  " + vLabel(d), "pin  " + d.pin.toFixed(0) + " mV",
                  "RSSI  " + d.rssi.toFixed(0) + " dBm"],
-  info: d => `${d.length} points · latest ${d[d.length - 1].y.toFixed(0)} mV at ${fmtUptime(d[d.length - 1].x)}`,
+  info: d => `${d.length} points` + (vEarlier ? ` in the latest run (${vEarlier} earlier rows in the CSV)` : "") +
+             ` · latest ${vLabel(d[d.length - 1])} at ${fmtUptime(d[d.length - 1].x)}`,
 });
 
 function renderRssi() {
@@ -529,23 +838,33 @@ function renderRssi() {
 
 /* ---- battery CSV ---- */
 let vData = [], lastPlotted = -1, loadingCsv = false;
+let curRatio = 0, plottedRatio = 0, vVolts = false, vEarlier = 0;
 
 async function loadChart() {
   if (loadingCsv) return;
   loadingCsv = true;
   try {
+    const ratio = curRatio;
     const text = await (await fetch("/data.csv", { cache: "no-store" })).text();
-    const out = [];
+    const rows = [];
     for (const line of text.split("\n")) {
       const c = line.split(",");
       if (c.length < 2) continue;
-      const t = parseFloat(c[0]), v = parseFloat(c[1]);
-      if (!Number.isFinite(t) || !Number.isFinite(v)) continue;
-      out.push({ x: t, y: v, rssi: parseFloat(c[2]) || 0 });
+      const t = parseFloat(c[0]), pin = parseFloat(c[1]);
+      if (!Number.isFinite(t) || !Number.isFinite(pin)) continue;
+      rows.push({ x: t, pin, rssi: parseFloat(c[2]) || 0 });
     }
-    vData = out;
-    lastPlotted = out.length ? out[out.length - 1].x : -1;
-    vChart.set(out);
+    // The discharge clock only ever steps back when a new run starts (Reset
+    // discharge clock, or a sender whose saved state was wiped), so plot from the
+    // last step back: older runs stay in the CSV but no longer draw over this one.
+    let start = 0;
+    for (let i = 1; i < rows.length; i++) if (rows[i].x < rows[i - 1].x) start = i;
+    vEarlier = start;
+    vVolts = ratio > 0;
+    vData = rows.slice(start).map(r => ({ ...r, y: vVolts ? r.pin * ratio / 1000 : r.pin }));
+    lastPlotted = vData.length ? vData[vData.length - 1].x : -1;
+    plottedRatio = ratio;
+    vChart.set(vData);
   } catch (e) {
     $("chartInfo").textContent = "Failed to load the log.";
   } finally {

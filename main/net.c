@@ -17,6 +17,15 @@
 
 static const char *TAG = "net";
 
+#if !CONFIG_NET_MODE_STA
+// WPA2 takes 8-63 characters. A shorter password makes esp_wifi_set_config()
+// fail, which ESP_ERROR_CHECK turns into a reboot loop with no dashboard to fix it
+// from, so refuse it at build time. Empty means an open network.
+_Static_assert(sizeof(CONFIG_NET_AP_PASSWORD) == 1 ||
+               (sizeof(CONFIG_NET_AP_PASSWORD) > 8 && sizeof(CONFIG_NET_AP_PASSWORD) <= 64),
+               "CONFIG_NET_AP_PASSWORD must be empty (open network) or 8-63 characters (WPA2)");
+#endif
+
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 #define MAX_RETRIES        10
@@ -67,10 +76,13 @@ esp_err_t net_start(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    uint8_t mac[6];
-    ESP_ERROR_CHECK(esp_efuse_mac_get_default(mac));
-    snprintf(s_ssid, sizeof(s_ssid), "%s-%02X%02X",
-             CONFIG_NET_AP_SSID_PREFIX, mac[4], mac[5]);
+    // Named by role, so the two boards are told apart on air and flipping a
+    // board's role in menuconfig renames its access point to match.
+#if CONFIG_ROLE_SENDER
+    snprintf(s_ssid, sizeof(s_ssid), "%s-send", CONFIG_NET_AP_SSID_PREFIX);
+#else
+    snprintf(s_ssid, sizeof(s_ssid), "%s-recv", CONFIG_NET_AP_SSID_PREFIX);
+#endif
 
 #if CONFIG_NET_MODE_STA
     esp_netif_create_default_wifi_sta();
@@ -128,7 +140,11 @@ esp_err_t net_start(void)
 
     strncpy(s_ip, "192.168.4.1", sizeof(s_ip));
     ESP_LOGI(TAG, "=========================================");
-    ESP_LOGI(TAG, " AP '%s' pass '%s'", s_ssid, CONFIG_NET_AP_PASSWORD);
+    if (wc.ap.authmode == WIFI_AUTH_OPEN) {
+        ESP_LOGI(TAG, " AP '%s', open (no password)", s_ssid);
+    } else {
+        ESP_LOGI(TAG, " AP '%s' pass '%s'", s_ssid, CONFIG_NET_AP_PASSWORD);
+    }
     ESP_LOGI(TAG, " Dashboard: http://%s/", s_ip);
     ESP_LOGI(TAG, "=========================================");
 #endif

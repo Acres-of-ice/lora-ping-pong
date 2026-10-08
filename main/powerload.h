@@ -6,18 +6,18 @@
 
 // Maximum-drain mode for the battery test: continuous full-size WiFi broadcasts
 // at 21 dBm with power save off. Ported from ESP32Webserver/main/powerload.c,
-// with the peer moved to the AP interface and the auto-start removed - here it is
-// armed by the battery-test mode switch, not at boot.
+// with the peer moved to the AP interface. Switched by the dashboard's max-drain
+// button; the last saved state is restored at boot.
 //
 // Combined with the SX1262 transmitting at +22 dBm this is roughly the worst case
 // the board can draw, which is the point: it is the load profile under test.
 
 // Configure ESP-NOW + radio. Call after net_start() has succeeded.
 //
-// Starts in whatever state was last saved, defaulting to ON. That default is
-// deliberate: this mode provokes brownout resets, and coming back up with the load
-// off would bend the discharge curve in a way that looks like the battery rather
-// than a missing load.
+// Starts in whatever state was last saved, and off on a fresh board. Saving it
+// matters: this mode provokes brownout resets, and coming back up with the load off
+// would bend the discharge curve in a way that looks like the battery rather than a
+// missing load.
 esp_err_t powerload_init(void);
 
 // The load is held off for CONFIG_POWERLOAD_ARM_DELAY_S after boot so the dashboard

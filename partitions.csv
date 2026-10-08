@@ -1,8 +1,12 @@
 # Partition table for the LoRa test rig (4MB flash).
 # The "storage" partition holds the receiver's SPIFFS battery CSV log. The sender
 # builds with the same table and simply never mounts it.
+# "runstate" holds what is rewritten with every packet (sequence numbers, counters,
+# the discharge clock), so that wear stays out of "nvs" with the settings. It sits
+# at the end so adding it moved nothing: existing settings and logs survive.
 # Name,     Type, SubType, Offset,   Size,     Flags
 nvs,        data, nvs,     0x9000,   0x6000,
 phy_init,   data, phy,     0xf000,   0x1000,
 factory,    app,  factory, 0x10000,  0x200000,
 storage,    data, spiffs,  ,         0x100000,
+runstate,   data, nvs,     ,         0x10000,

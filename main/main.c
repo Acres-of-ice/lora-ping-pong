@@ -13,8 +13,10 @@
 
 #include "link.h"
 #include "net.h"
+#include "runstate.h"
 #include "sx126x.h"
 #include "webserver.h"
+#include "solar.h"
 
 #if CONFIG_ROLE_SENDER
 #include "battery.h"
@@ -64,6 +66,11 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
+    // Not fatal: without it the run simply restarts its numbering at every boot.
+    runstate_init();
+    // Before anything that reads it - the radio tasks report it in every packet and
+    // the dashboard shows it - so no two tasks race to set the pins up.
+    charge_gpio_init_once();
 
     // Radio first: a wiring fault should surface before WiFi fills the log.
     esp_err_t err = sx126x_init();
@@ -86,20 +93,22 @@ void app_main(void)
         ESP_LOGW(TAG, "No network; the radio still runs but the dashboard is unavailable");
     }
 
-// #if CONFIG_ROLE_SENDER
-//     // Not fatal: without WiFi there is no max-drain load, but the LoRa side works.
-//     powerload_init();
-// #endif
+#if CONFIG_ROLE_SENDER
+    // Not fatal: without WiFi there is no max-drain load, but the LoRa side works.
+    powerload_init();
+#endif
 
-    if (net_wifi_is_on()) {
-        webserver_start();
-    }
-
+    // The radio task before the web server: its handlers lock state the task's
+    // start function creates, so a request arriving first would crash the board.
 #if CONFIG_ROLE_SENDER
     ESP_ERROR_CHECK(sender_start());
 #else
     ESP_ERROR_CHECK(receiver_start());
 #endif
+
+    if (net_wifi_is_on()) {
+        webserver_start();
+    }
 
     ESP_LOGI(TAG, "Ready - dashboard at http://%s/", net_ip_str());
 }

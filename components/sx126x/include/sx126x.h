@@ -48,6 +48,7 @@ typedef struct {
     float   rssi;         // RssiPkt, dBm
     float   snr;          // SnrPkt, dB
     float   signal_rssi;  // SignalRssiPkt, dBm (after despreading; valid below the noise floor)
+    float   freq_err_hz;  // carrier offset between the two radios, Hz (estimate; see sx126x.c)
     uint8_t len;
 } sx126x_rxinfo_t;
 

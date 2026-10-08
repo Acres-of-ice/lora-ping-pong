@@ -14,6 +14,7 @@
 #include "link.h"
 #include "net.h"
 #include "sdkconfig.h"
+#include "solar.h"
 
 #if CONFIG_ROLE_SENDER
 #include "battery.h"
@@ -116,7 +117,7 @@ static bool cfg_from_query(const char *query, sx126x_cfg_t *cfg, const char **er
         cfg->cr = (uint8_t)v;
     }
     if (q_long(query, "pre", &v)) {
-        if (v < 6 || v > 65535) { *err = "preamble must be 6..65535"; return false; }
+        if (v < 1 || v > 65535) { *err = "preamble must be 1..65535"; return false; }
         cfg->preamble = (uint16_t)v;
     }
     if (q_long(query, "pwr", &v)) {
@@ -125,7 +126,7 @@ static bool cfg_from_query(const char *query, sx126x_cfg_t *cfg, const char **er
     }
     if (q_long(query, "freq", &v)) {
         if (v < (long)LINK_FREQ_MIN_HZ || v > (long)LINK_FREQ_MAX_HZ) {
-            *err = "frequency outside the radio module's band";
+            *err = "frequency must be 150000000..960000000 Hz";
             return false;
         }
         cfg->freq_hz = (uint32_t)v;
@@ -160,6 +161,9 @@ static esp_err_t radio_handler(httpd_req_t *req)
         if (link_request_apply(&cfg, true) != ESP_OK) {
             return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "queue failed");
         }
+#if CONFIG_ROLE_SENDER
+        sender_wake();  // apply now, not after the current packet interval
+#endif
     }
 
     sx126x_cfg_t cur;
@@ -257,10 +261,11 @@ static esp_err_t status_handler(httpd_req_t *req)
     const uint32_t up     = battery_uptime_s();
     const int      pin_mv = battery_read_pin_mv();
 
-    char push[96];
+    char push[96], remote[80];
     sender_cfg_push_state(push, sizeof(push));
+    sender_remote_command_state(remote, sizeof(remote));
 
-    char buf[1200];
+    char buf[1536];
     int n = snprintf(buf, sizeof(buf),
         "{\"role\":\"sender\",\"mode\":\"%s\",\"ip\":\"%s\",\"ssid\":\"%s\","
         "\"wifi\":%s,\"running\":%s,\"interval_ms\":%lu,"
@@ -268,9 +273,10 @@ static esp_err_t status_handler(httpd_req_t *req)
         "\"next_seq\":%lu,\"last_rtt_ms\":%lu,"
         "\"ack_rssi\":%.1f,\"ack_snr\":%.1f,\"local_rssi\":%.1f,\"local_snr\":%.1f,"
         "\"ack_airtime_ms\":%.2f,\"duty_cycle\":%.4f,\"log_seq\":%lu,"
-        "\"pin_mv\":%d,\"uptime_s\":%lu,"
+        "\"pin_mv\":%d,\"batt_mv\":%d,\"ratio\":%.3f,\"uptime_s\":%lu,"
         "\"load\":%s,\"load_arming_s\":%lu,\"push_busy\":%s,\"push_state\":\"%s\","
-        "\"rollback_pending\":%s,\"rollback_s\":%lu,",
+        "\"remote_cmd\":\"%s\",\"charge\":\"%s\",\"peer_charge\":\"%s\","
+        "\"apply_pending\":%s,\"rollback_pending\":%s,\"rollback_s\":%lu,",
         link_mode_str(link_get_mode()), net_ip_str(), net_ssid(),
         net_wifi_is_on() ? "true" : "false",
         st.running ? "true" : "false", (unsigned long)st.interval_ms,
@@ -280,10 +286,12 @@ static esp_err_t status_handler(httpd_req_t *req)
         (unsigned long)st.next_seq, (unsigned long)st.last_rtt_ms,
         st.last_ack_rssi, st.last_ack_snr, st.last_local_rssi, st.last_local_snr,
         st.ack_airtime_ms, st.duty_cycle, (unsigned long)st.log_seq,
-        pin_mv, (unsigned long)up,
+        pin_mv, battery_mv_from_pin(pin_mv), battery_ratio_x1000() / 1000.0, (unsigned long)up,
         powerload_is_on() ? "true" : "false",
         (unsigned long)powerload_arming_in_s(),
-        sender_cfg_push_busy() ? "true" : "false", push,
+        sender_cfg_push_busy() ? "true" : "false", push, remote,
+        charge_state_str(charge_state()), charge_state_str((charge_state_t)st.peer_charge),
+        link_apply_queued() ? "true" : "false",
         link_profile_is_provisional() ? "true" : "false",
         (unsigned long)link_profile_revert_in_s());
 
@@ -316,11 +324,11 @@ static esp_err_t log_handler(httpd_req_t *req)
     for (int i = 0; i < count && err == ESP_OK; i++) {
         const sender_log_t *e = &entries[i];
         err = chunk_printf(&c,
-            "%s{\"seq\":%lu,\"len\":%u,\"type\":%u,\"acked\":%s,\"rtt_ms\":%u,"
+            "%s{\"seq\":%lu,\"len\":%u,\"type\":%u,\"acked\":%s,\"rtt_ms\":%lu,"
             "\"airtime_ms\":%.2f,\"ack_rssi\":%.1f,\"ack_snr\":%.1f,"
             "\"local_rssi\":%.1f,\"local_snr\":%.1f,\"uptime_s\":%lu}",
             i ? "," : "", (unsigned long)e->seq, e->len, e->type,
-            e->acked ? "true" : "false", e->rtt_ms, e->airtime_ms,
+            e->acked ? "true" : "false", (unsigned long)e->rtt_ms, e->airtime_ms,
             e->ack_rssi, e->ack_snr, e->local_rssi, e->local_snr,
             (unsigned long)e->at_uptime_s);
     }
@@ -337,25 +345,36 @@ static esp_err_t log_handler(httpd_req_t *req)
 }
 
 // GET /control?run=1&interval_ms=5000&size=255
+// Every value is checked before any is applied: a bad size used to be rejected
+// only after the interval in the same request had already been saved.
 static esp_err_t control_handler(httpd_req_t *req)
 {
     char query[QUERY_MAX];
     get_query(req, query, sizeof(query));
-    long v;
+    long run = 0, interval = 0, size = 0;
+    const bool has_run      = q_long(query, "run", &run);
+    const bool has_interval = q_long(query, "interval_ms", &interval);
+    const bool has_size     = q_long(query, "size", &size);
 
-    if (q_long(query, "run", &v)) {
-        sender_set_running(v != 0);
+    if (has_interval && (interval < 0 || interval > 600000)) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "interval must be 0..600000 ms (0 = back-to-back)");
     }
-    if (q_long(query, "interval_ms", &v)) {
-        if (sender_set_interval((uint32_t)v) != ESP_OK) {
-            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                                       "interval must be 0..600000 ms (0 = back-to-back)");
-        }
+    if (has_size && (size < (long)sizeof(link_batt_t) || size > LINK_MAX_PAYLOAD)) {
+        char msg[40];
+        snprintf(msg, sizeof(msg), "size must be %u..%u bytes",
+                 (unsigned)sizeof(link_batt_t), (unsigned)LINK_MAX_PAYLOAD);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
     }
-    if (q_long(query, "size", &v)) {
-        if (sender_set_payload_len((int)v) != ESP_OK) {
-            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "size must be 16..255 bytes");
-        }
+
+    if (has_run) {
+        sender_set_running(run != 0);
+    }
+    if (has_interval) {
+        sender_set_interval((uint32_t)interval);
+    }
+    if (has_size) {
+        sender_set_payload_len((int)size);
     }
     if (q_is(query, "reset", "1")) {
         sender_reset_counters();
@@ -433,12 +452,61 @@ static esp_err_t uptime_handler(httpd_req_t *req)
     get_query(req, query, sizeof(query));
 
     if (q_is(query, "reset", "1")) {
-        battery_uptime_reset();
+        sender_reset_discharge_clock();
     }
 
     char buf[48];
     const int n = snprintf(buf, sizeof(buf), "{\"uptime_s\":%lu}",
                            (unsigned long)battery_uptime_s());
+    return send_json(req, buf, n);
+}
+
+// GET /battery                    -> sense pin, divider ratio, battery mV
+// GET /battery?actual_mv=4160     -> calibrate the ratio from a multimeter reading
+// GET /battery?ratio_x1000=4765   -> set the ratio directly
+// GET /battery?reset=1            -> back to the build default
+static esp_err_t battery_handler(httpd_req_t *req)
+{
+    char query[QUERY_MAX];
+    get_query(req, query, sizeof(query));
+    long v;
+    char msg[96];
+    esp_err_t err = ESP_OK;
+
+    if (q_long(query, "actual_mv", &v)) {
+        if (v < 500 || v > 30000) {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "actual_mv must be 500..30000");
+        }
+        int pin = 0;
+        err = battery_calibrate((uint32_t)v, &pin);
+        if (err == ESP_ERR_INVALID_STATE) {
+            snprintf(msg, sizeof(msg), "the sense pin reads %d mV: no battery to calibrate against", pin);
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+        }
+        if (err == ESP_ERR_INVALID_ARG) {
+            snprintf(msg, sizeof(msg), "%ld mV for %d mV at the pin is a ratio outside 1..20: "
+                     "check the reading", v, pin);
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+        }
+    } else if (q_long(query, "ratio_x1000", &v)) {
+        err = battery_set_ratio_x1000(v < 0 ? 0 : (uint32_t)v);
+        if (err == ESP_ERR_INVALID_ARG) {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ratio_x1000 must be 1000..20000");
+        }
+    } else if (q_is(query, "reset", "1")) {
+        battery_ratio_reset();
+    }
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "ratio applied but could not be saved");
+    }
+
+    const int pin_mv = battery_read_pin_mv();
+    char buf[112];
+    const int n = snprintf(buf, sizeof(buf),
+        "{\"pin_mv\":%d,\"batt_mv\":%d,\"ratio\":%.3f,\"default_ratio\":%.3f}",
+        pin_mv, battery_mv_from_pin(pin_mv), battery_ratio_x1000() / 1000.0,
+        battery_ratio_default_x1000() / 1000.0);
     return send_json(req, buf, n);
 }
 
@@ -466,7 +534,9 @@ static esp_err_t status_handler(httpd_req_t *req)
     sx126x_cfg_t cfg;
     link_get_cfg(&cfg);
 
-    char buf[1200];
+    // Static for the same single-task reason as the log handlers: at ~1.6 KB worst
+    // case it is too big for the handler's stack alongside the formatting.
+    static char buf[2048];
     int n = snprintf(buf, sizeof(buf),
         "{\"role\":\"receiver\",\"mode\":\"%s\",\"ip\":\"%s\",\"ssid\":\"%s\","
         "\"rx\":%lu,\"lost\":%lu,\"dup\":%lu,\"out_of_order\":%lu,"
@@ -474,9 +544,10 @@ static esp_err_t status_handler(httpd_req_t *req)
         "\"have_packet\":%s,\"last_seq\":%lu,\"since_last_s\":%lu,"
         "\"rssi\":%.1f,\"snr\":%.1f,\"signal_rssi\":%.1f,\"noise_floor\":%.1f,"
         "\"snr_margin\":%.1f,\"link_budget\":%.1f,\"fade_margin\":%.1f,"
-        "\"log_seq\":%lu,\"have_batt\":%s,\"pin_mv\":%u,"
+        "\"log_seq\":%lu,\"have_batt\":%s,\"pin_mv\":%u,\"batt_mv\":%lu,\"ratio\":%.3f,"
         "\"batt_uptime_s\":%lu,"
-        "\"rollback_pending\":%s,\"rollback_s\":%lu,",
+        "\"charge\":\"%s\",\"peer_charge\":\"%s\","
+        "\"apply_pending\":%s,\"rollback_pending\":%s,\"rollback_s\":%lu,",
         link_mode_str(link_get_mode()), net_ip_str(), net_ssid(),
         (unsigned long)st.rx_count, (unsigned long)st.lost, (unsigned long)st.dup,
         (unsigned long)st.out_of_order, st.crc_err, st.hdr_err, st.pdr,
@@ -485,9 +556,27 @@ static esp_err_t status_handler(httpd_req_t *req)
         st.last_rssi, st.last_snr, st.last_signal_rssi, st.noise_floor,
         st.snr_margin, st.link_budget, st.fade_margin,
         (unsigned long)st.log_seq, st.have_batt ? "true" : "false",
-        st.batt_pin_mv, (unsigned long)st.batt_uptime_s,
+        st.batt_pin_mv, (unsigned long)st.batt_mv, st.batt_ratio_x1000 / 1000.0,
+        (unsigned long)st.batt_uptime_s,
+        charge_state_str(charge_state()), charge_state_str((charge_state_t)st.peer_charge),
+        link_apply_queued() ? "true" : "false",
         link_profile_is_provisional() ? "true" : "false",
         (unsigned long)link_profile_revert_in_s());
+
+    n += snprintf(buf + n, sizeof(buf) - n,
+        "\"cmd_queued\":%d,\"cmd_waiting\":\"%s\",\"cmd_state\":\"%s\","
+        "\"contact_seen\":%s,\"contact_age_s\":%lu,\"sender_stopped\":%s,"
+        "\"sender_known\":%s,\"sender_age_s\":%lu,\"sender_running\":%s,"
+        "\"sender_mode\":\"%s\",\"sender_interval_ms\":%lu,\"sender_payload\":%u,"
+        "\"sender_load\":%s,\"sender_wifi\":%s,\"sender_ratio\":%.3f,",
+        st.cmd_queued, st.cmd_waiting, st.cmd_state,
+        st.contact_seen ? "true" : "false", (unsigned long)st.contact_age_s,
+        st.sender_stopped ? "true" : "false",
+        st.sender_known ? "true" : "false", (unsigned long)st.sender_age_s,
+        st.sender_running ? "true" : "false", link_mode_str((link_mode_t)st.sender_mode),
+        (unsigned long)st.sender_interval_ms, st.sender_payload,
+        st.sender_load ? "true" : "false", st.sender_wifi ? "true" : "false",
+        st.sender_ratio_x1000 / 1000.0);
 
     n += link_cfg_json(buf + n, sizeof(buf) - n, &cfg, LINK_MAX_PAYLOAD);
     n += snprintf(buf + n, sizeof(buf) - n, "}");
@@ -516,10 +605,16 @@ static esp_err_t log_handler(httpd_req_t *req)
     for (int i = 0; i < count && err == ESP_OK; i++) {
         const receiver_log_t *e = &entries[i];
         err = chunk_printf(&c,
-            "%s{\"seq\":%lu,\"len\":%u,\"type\":%u,\"rssi\":%.1f,\"snr\":%.1f,"
-            "\"signal_rssi\":%.1f,\"gap\":%u,\"uptime_s\":%lu}",
-            i ? "," : "", (unsigned long)e->seq, e->len, e->type,
-            e->rssi, e->snr, e->signal_rssi, e->gap, (unsigned long)e->at_uptime_s);
+            "%s{\"seq\":%lu,\"len\":%u,\"type\":%u,\"rssi\":%.1f,\"signal_rssi\":%.1f,"
+            "\"snr\":%.1f,\"snr_margin\":%.1f,\"fade_margin\":%.1f,\"path_loss\":%.1f,"
+            "\"freq_err\":%.0f,\"noise_floor\":%.1f,\"gap\":%u,\"pdr\":%.1f,\"lost\":%lu,"
+            "\"dup\":%lu,\"out_of_order\":%lu,\"crc_err\":%u,\"hdr_err\":%u,"
+            "\"batt_mv\":%u,\"charge\":%u,\"uptime_s\":%lu}",
+            i ? "," : "", (unsigned long)e->seq, e->len, e->type, e->rssi, e->signal_rssi,
+            e->snr, e->snr_margin, e->fade_margin, e->path_loss, e->freq_err_hz,
+            e->noise_floor, e->gap, e->pdr, (unsigned long)e->lost, (unsigned long)e->dup,
+            (unsigned long)e->out_of_order, e->crc_err, e->hdr_err, e->batt_mv, e->charge,
+            (unsigned long)e->at_uptime_s);
     }
     if (err == ESP_OK) {
         err = chunk_printf(&c, "]}");
@@ -538,25 +633,34 @@ static esp_err_t csv_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "text/csv");
     httpd_resp_set_hdr(req, "Content-Disposition",
                        "attachment; filename=\"battery_log.csv\"");
+    no_store(req);  // a cached copy would be missing every sample since
 
+    // The lock is taken per read, never across a send. The receiver task appends
+    // under it from inside its radio loop, before acknowledging the packet, so
+    // holding it for a whole transfer - seconds for a long log or a dozing phone,
+    // and the dashboard refetches this file on every new sample - held the
+    // acknowledgements past the sender's window.
     storage_lock();
     FILE *f = fopen(STORAGE_CSV_PATH, "r");
+    storage_unlock();
     if (f == NULL) {
-        storage_unlock();
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no log file");
     }
 
     char chunk[512];
-    size_t r;
-    while ((r = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+    for (;;) {
+        storage_lock();
+        const size_t r = fread(chunk, 1, sizeof(chunk), f);
+        storage_unlock();
+        if (r == 0) {
+            break;
+        }
         if (httpd_resp_send_chunk(req, chunk, r) != ESP_OK) {
             fclose(f);
-            storage_unlock();
             return ESP_FAIL;
         }
     }
     fclose(f);
-    storage_unlock();
     return httpd_resp_send_chunk(req, NULL, 0);
 }
 
@@ -579,6 +683,107 @@ static esp_err_t reset_handler(httpd_req_t *req)
     return send_json(req, "{\"reset\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
+// The sender's commands, by the name /sendercmd takes. A command with an argument
+// reads it from `key`, checked against the same range the sender's own route uses,
+// so a bad value is refused here rather than after a trip over the air.
+typedef struct {
+    const char *name;
+    uint8_t     op;       // link_cmd_op_t
+    const char *key;      // NULL: no argument
+    long        min, max;
+    bool        confirm;  // destructive, so confirm=1 as on the sender's own routes
+} sender_cmd_t;
+
+static const sender_cmd_t SENDER_CMDS[] = {
+    { "status",      LINK_CMD_STATUS,         NULL,        0,   0,                   false },
+    { "run",         LINK_CMD_RUN,            "on",        0,   1,                   false },
+    { "interval",    LINK_CMD_INTERVAL,       "ms",        0,   600000,              false },
+    { "payload",     LINK_CMD_PAYLOAD,        "size",      sizeof(link_batt_t), LINK_MAX_PAYLOAD, false },
+    { "reset",       LINK_CMD_RESET_COUNTERS, NULL,        0,   0,                   false },
+    { "load",        LINK_CMD_LOAD,           "on",        0,   1,                   false },
+    { "clock_reset", LINK_CMD_RESET_CLOCK,    NULL,        0,   0,                   false },
+    { "calibrate",   LINK_CMD_CALIBRATE,      "actual_mv", 500, 30000,               false },
+    { "ratio_reset", LINK_CMD_RATIO_RESET,    NULL,        0,   0,                   false },
+    { "wifi_off",    LINK_CMD_WIFI_OFF,       NULL,        0,   0,                   true },
+    { "reboot",      LINK_CMD_REBOOT,         NULL,        0,   0,                   true },
+};
+
+// GET /sendercmd?op=interval&ms=2000         -> queue a command for the sender
+// GET /sendercmd?op=mode&m=battery           -> battery or range test
+// GET /sendercmd?op=push&confirm=1&sf=10...  -> a profile for both, as /radio takes it
+// GET /sendercmd?op=cancel                   -> drop everything still waiting
+//
+// Queued, not sent: commands ride on this board's acknowledgements, so each goes out
+// with the sender's next packet, or its next check-in while stopped.
+static esp_err_t sendercmd_handler(httpd_req_t *req)
+{
+    char query[QUERY_MAX], name[16];
+    get_query(req, query, sizeof(query));
+    if (!q_str(query, "op", name, sizeof(name))) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing op");
+    }
+    if (strcmp(name, "cancel") == 0) {
+        receiver_cancel_commands();
+        return send_json(req, "{\"cancelled\":true}", HTTPD_RESP_USE_STRLEN);
+    }
+
+    uint8_t      op  = 0;
+    uint32_t     arg = 0;
+    sx126x_cfg_t cfg;
+    bool         has_cfg = false;
+    char         msg[64];
+
+    if (strcmp(name, "mode") == 0) {
+        op = LINK_CMD_MODE;
+        if (q_is(query, "m", "battery")) {
+            arg = LINK_MODE_BATTERY;
+        } else if (q_is(query, "m", "range")) {
+            arg = LINK_MODE_RANGE;
+        } else {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "m must be range or battery");
+        }
+    } else if (strcmp(name, "push") == 0) {
+        if (!q_is(query, "confirm", "1")) {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing confirm=1");
+        }
+        const char *err = NULL;
+        if (!cfg_from_query(query, &cfg, &err)) {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err);
+        }
+        op      = LINK_CMD_PUSH_CFG;
+        has_cfg = true;
+    } else {
+        const sender_cmd_t *c = NULL;
+        for (size_t i = 0; i < sizeof(SENDER_CMDS) / sizeof(SENDER_CMDS[0]); i++) {
+            if (strcmp(name, SENDER_CMDS[i].name) == 0) {
+                c = &SENDER_CMDS[i];
+                break;
+            }
+        }
+        if (c == NULL) {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unknown op");
+        }
+        if (c->confirm && !q_is(query, "confirm", "1")) {
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing confirm=1");
+        }
+        if (c->key != NULL) {
+            long v;
+            if (!q_long(query, c->key, &v) || v < c->min || v > c->max) {
+                snprintf(msg, sizeof(msg), "%s must be %ld..%ld", c->key, c->min, c->max);
+                return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+            }
+            arg = (uint32_t)v;
+        }
+        op = c->op;
+    }
+
+    if (receiver_queue_command(op, arg, has_cfg ? &cfg : NULL) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                   "the queue is full: wait for the sender, or cancel");
+    }
+    return send_json(req, "{\"queued\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
 #endif
 
 // ------------------------------------------------------------------ start ----
@@ -587,7 +792,7 @@ esp_err_t webserver_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 16;  // the sender registers 13; a 13th past the limit fails silently
     config.stack_size       = 6144;  // the log handlers format a lot of JSON
     // The default 5 s is tight when max-drain mode is saturating the WiFi TX path
     // or a phone client is dozing; both show up as EAGAIN on send.
@@ -615,10 +820,12 @@ esp_err_t webserver_start(void)
         { .uri = "/load",        .method = HTTP_GET, .handler = load_handler },
         { .uri = "/uptime",      .method = HTTP_GET, .handler = uptime_handler },
         { .uri = "/wifi",        .method = HTTP_GET, .handler = wifi_handler },
+        { .uri = "/battery",     .method = HTTP_GET, .handler = battery_handler },
 #else
         { .uri = "/data.csv",    .method = HTTP_GET, .handler = csv_handler },
         { .uri = "/clear",       .method = HTTP_GET, .handler = clear_handler },
         { .uri = "/reset",       .method = HTTP_GET, .handler = reset_handler },
+        { .uri = "/sendercmd",   .method = HTTP_GET, .handler = sendercmd_handler },
 #endif
     };
     for (int i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {

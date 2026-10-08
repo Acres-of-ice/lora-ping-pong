@@ -12,7 +12,7 @@ typedef struct {
     uint32_t seq;
     uint32_t at_uptime_s;
     float    airtime_ms;
-    uint16_t rtt_ms;
+    uint32_t rtt_ms;       // can exceed 65 s: SF12/BW7.8 is ~163 s per exchange
     uint8_t  len;
     uint8_t  type;         // link_pkt_type_t
     bool     acked;
@@ -37,9 +37,15 @@ typedef struct {
     float    last_ack_rssi, last_ack_snr;
     float    last_local_rssi, last_local_snr;
     uint32_t log_seq;         // total log entries ever written; a cursor for the UI
+    uint8_t  peer_charge;     // receiver's solar charger (charge_state_t), from its ACKs
 } sender_status_t;
 
 esp_err_t sender_start(void);
+
+// Cut the radio task's wait between packets short so it acts on a change at once:
+// a queued profile, a push, a stop or a new interval. Pacing is unaffected - the
+// task goes back to waiting out whatever remains of the interval.
+void sender_wake(void);
 
 void sender_get_status(sender_status_t *out);
 
@@ -51,6 +57,8 @@ void      sender_set_running(bool run);
 esp_err_t sender_set_interval(uint32_t ms);
 esp_err_t sender_set_payload_len(int len);
 void      sender_reset_counters(void);
+// Start a fresh discharge cycle at zero, saved at once.
+void      sender_reset_discharge_clock(void);
 
 // Ask the radio task to negotiate `cfg` with the receiver and adopt it here too.
 // Returns immediately; poll sender_cfg_push_state() for the outcome.
@@ -65,3 +73,7 @@ bool      sender_cfg_push_busy(void);
 // Copies the state string out under the lock; the radio task rewrites it as the
 // handshake progresses, so callers must not hold a pointer into it.
 void      sender_cfg_push_state(char *out, size_t n);
+
+// The last command the receiver's dashboard sent, and its outcome, e.g.
+// "battery test: done". Empty until one arrives.
+void      sender_remote_command_state(char *out, size_t n);

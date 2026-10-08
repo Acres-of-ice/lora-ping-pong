@@ -26,6 +26,8 @@ uint32_t storage_last_uptime(void);
 // Truncate back to the header row.
 esp_err_t storage_clear(void);
 
-// Serialise access so appends and the /data.csv stream never overlap.
+// Serialise access so an append and a /data.csv read never interleave. Hold it
+// only around file operations: the receiver appends from its radio loop, so
+// anything slow done under it (a network send) delays acknowledgements.
 void storage_lock(void);
 void storage_unlock(void);

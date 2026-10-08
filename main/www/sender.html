@@ -103,6 +103,11 @@
       <div class="note">duty <span id="duty">–</span>%</div>
     </div>
     <div class="card">
+      <div class="label">Battery</div>
+      <div class="value"><span id="battV">–</span> <small>V</small></div>
+      <div class="note">sense pin × <span id="ratio">–</span></div>
+    </div>
+    <div class="card">
       <div class="label">Sense pin</div>
       <div class="value"><span id="pinMv">–</span> <small>mV</small></div>
       <div class="note">as measured, no divider</div>
@@ -111,6 +116,11 @@
       <div class="label">Discharge uptime</div>
       <div class="value" id="uptime" style="font-size:1.25rem">–</div>
       <div class="note">survives a brownout</div>
+    </div>
+    <div class="card">
+      <div class="label">Solar charging</div>
+      <div class="value" id="chargeSelf" style="font-size:1.05rem">–</div>
+      <div class="note">receiver: <span id="chargePeer">–</span></div>
     </div>
   </div>
 
@@ -130,7 +140,7 @@
       </div>
       <div>
         <label class="f" for="size">Payload (bytes)</label>
-        <input id="size" type="number" min="14" max="255">
+        <input id="size" type="number" min="17" max="255">
       </div>
       <div style="align-self:end">
         <button id="saveCtl">Save</button>
@@ -138,6 +148,7 @@
     </div>
     <div class="derived" id="controlNote"></div>
     <div class="derived" id="saveNote"></div>
+    <div class="derived" id="remoteNote"></div>
   </div>
 
   <div class="panel">
@@ -163,7 +174,7 @@
       </div>
       <div>
         <label class="f" for="pre">Preamble (symbols)</label>
-        <input id="pre" type="number" min="6" max="65535">
+        <input id="pre" type="number" min="1" max="65535">
       </div>
       <div>
         <label class="f" for="pwr">TX power (dBm)</label>
@@ -171,10 +182,11 @@
       </div>
       <div>
         <label class="f" for="freq">Frequency (Hz)</label>
-        <input id="freq" type="number" min="803000000" max="930000000" step="100">
+        <input id="freq" type="number" min="150000000" max="960000000" step="1">
       </div>
     </div>
     <div class="derived" id="calc"></div>
+    <div class="derived" id="applyState"></div>
     <div class="derived" id="pushState"></div>
   </div>
 
@@ -187,10 +199,21 @@
       </div>
     </div>
     <div class="fields">
+      <div>
+        <label class="f" for="calV">Multimeter reading (V)</label>
+        <input id="calV" type="number" min="0.5" max="30" step="0.001" placeholder="e.g. 4.16">
+      </div>
+      <div style="align-self:end">
+        <button id="calBtn">Calibrate</button>
+        <button id="calReset">Reset ratio</button>
+      </div>
       <div style="align-self:end">
         <button id="uptimeReset" class="danger">Reset discharge clock</button>
       </div>
     </div>
+    <div class="derived">Measure the battery with a multimeter, enter the reading and press
+      Calibrate: the board works out its divider ratio from the sense pin and saves it.</div>
+    <div class="derived" id="calNote"></div>
   </div>
 
   <div class="panel">
@@ -238,13 +261,17 @@ function airtimeMs(sf, bwHz, cr, preamble, crc, len) {
   const de = tsym > 16 ? 1 : 0;
   const nPre = preamble + (sf < 7 ? 6.25 : 4.25);
   const den = (sf < 7) ? (4 * sf) : (4 * (sf - 2 * de));
-  const num = 8 * len - 4 * sf + 28 + 16 * (crc ? 1 : 0);
+  // +8 only for SF7-12; +20 for the explicit header.
+  const num = 8 * len + 16 * (crc ? 1 : 0) - 4 * sf + (sf < 7 ? 0 : 8) + 20;
   const blocks = Math.max(Math.ceil(num / den), 0);
   return (nPre + 8 + blocks * cr) * tsym;
 }
 function sensitivityDbm(sf, bwHz) {
   return -174 + 10 * Math.log10(bwHz) + 6 + (-2.5 * (sf - 4));
 }
+// Mirrors poll_period_ms(): a stopped sender checks in every 5 s, but never spends
+// more than a tenth of the time on air doing it.
+const pollEveryMs = d => Math.max(5000, 10 * airtimeMs(d.sf, d.bw_hz, d.cr, d.preamble, d.crc, 10));
 
 const BW_LIST = [7810, 10420, 15630, 20830, 31250, 41670, 62500, 125000, 250000, 500000];
 function fillSelects() {
@@ -262,7 +289,8 @@ function setConn(ok) {
 
 /* ---- radio form ---- */
 let touched = false;                      // don't clobber a form being edited
-const FORM = ["sf", "bw", "cr", "pre", "pwr", "freq"];
+let awaiting = null;                      // "apply" or "push" until the radio has it
+const FORM =["sf", "bw", "cr", "pre", "pwr", "freq"];
 FORM.forEach(id => $(id).addEventListener("input", () => { touched = true; recalc(); }));
 
 function formCfg() {
@@ -274,14 +302,14 @@ function formCfg() {
 
 function recalc() {
   const c = formCfg();
-  const len = Math.max(16, Math.min(255, +$("size").value || 255));
+  const len = Math.max(17, Math.min(255, +$("size").value || 255));
   // Not `+value || 5000`: zero is a valid interval and would fall through as falsy.
   const ivRaw = $("interval").value.trim();
   const interval = ivRaw === "" ? 5000 : Math.max(0, Math.min(600000, +ivRaw));
   if (!c.sf || !c.bw) return;
 
   const toa = airtimeMs(c.sf, c.bw, c.cr, c.pre, true, len);
-  const ackToa = airtimeMs(c.sf, c.bw, c.cr, c.pre, true, 13);
+  const ackToa = airtimeMs(c.sf, c.bw, c.cr, c.pre, true, 14);
   const round = toa + ackToa;
   const cycle = Math.max(interval, round);
   const duty = 100 * toa / cycle;
@@ -329,14 +357,14 @@ async function applyLocal() {
                "changes both — use this only to recover an already-broken link.")) return;
   const r = await fetch("/radio?" + cfgQuery(), { cache: "no-store" });
   if (!r.ok) { alert("Rejected: " + await r.text()); return; }
-  touched = false;
+  awaiting = "apply";
   pollStatus();
 }
 
 async function pushCfg() {
   const r = await fetch("/pushcfg?confirm=1&" + cfgQuery(), { cache: "no-store" });
   if (!r.ok) { alert("Rejected: " + await r.text()); return; }
-  touched = false;
+  awaiting = "push";
   $("pushState").textContent = "Push queued…";
 }
 
@@ -359,7 +387,14 @@ $("clearLog").onclick = () => { rows = []; renderLog(); };
 // Both values are persisted on the device, so this survives a reset - which matters
 // for a battery run that is expected to brown out partway through.
 async function saveControl() {
-  const iv = +$("interval").value, sz = +$("size").value;
+  const ivRaw = $("interval").value.trim(), szRaw = $("size").value.trim();
+  // An empty box reads as 0, and an interval of 0 means back-to-back at full
+  // drain - never save that from a field that was merely cleared.
+  if (ivRaw === "" || szRaw === "") {
+    $("saveNote").innerHTML = `<span class="bad">Enter both an interval and a payload size.</span>`;
+    return;
+  }
+  const iv = +ivRaw, sz = +szRaw;
   const r = await fetch(`/control?interval_ms=${iv}&size=${sz}`, { cache: "no-store" });
   if (!r.ok) {
     $("saveNote").innerHTML = `<span class="bad">Rejected: ${await r.text()}</span>`;
@@ -376,16 +411,49 @@ $("interval").addEventListener("change", saveControl);
 $("size").addEventListener("change", saveControl);
 
 $("uptimeReset").onclick = () => {
-  if (!confirm("Reset the discharge clock to zero? The receiver's graph will restart.")) return;
+  if (!confirm("Reset the discharge clock to zero?\n\nThe receiver's graph starts a new run; " +
+               "its CSV keeps the old one.")) return;
   post("/uptime?reset=1").then(pollStatus);
+};
+
+// The ratio is worked out on the board from its own pin reading at that moment, so
+// take the multimeter reading with the battery as it is now.
+$("calBtn").onclick = async () => {
+  const v = parseFloat($("calV").value);
+  if (!(v >= 0.5 && v <= 30)) {
+    $("calNote").innerHTML = `<span class="bad">Enter the multimeter reading in volts, e.g. 4.16.</span>`;
+    return;
+  }
+  const r = await fetch(`/battery?actual_mv=${Math.round(v * 1000)}`, { cache: "no-store" });
+  if (!r.ok) {
+    $("calNote").innerHTML = `<span class="bad">Rejected: ${await r.text()}</span>`;
+    return;
+  }
+  const d = await r.json();
+  $("calNote").innerHTML = `<span class="ok">Calibrated: ratio ${d.ratio.toFixed(3)} ` +
+    `(pin ${d.pin_mv} mV → ${(d.batt_mv / 1000).toFixed(3)} V). Saved on the board.</span>`;
+  $("calV").value = "";
+  pollStatus();
+};
+$("calReset").onclick = async () => {
+  if (!confirm("Forget the calibration and go back to the default divider ratio?")) return;
+  const r = await fetch("/battery?reset=1", { cache: "no-store" });
+  if (!r.ok) {
+    $("calNote").innerHTML = `<span class="bad">Rejected: ${await r.text()}</span>`;
+    return;
+  }
+  const d = await r.json();
+  $("calNote").innerHTML = `<span class="ok">Ratio back to the default ${d.ratio.toFixed(3)}.</span>`;
+  pollStatus();
 };
 $("rebootBtn").onclick = () => {
   if (!confirm("Reboot the sender?")) return;
   fetch("/reboot?confirm=1", { cache: "no-store" });
 };
 $("wifiOff").onclick = () => {
-  if (!confirm("Turn WiFi off?\n\nThis dashboard becomes unreachable until you reset the board. " +
-               "LoRa keeps transmitting and the receiver keeps logging.")) return;
+  if (!confirm("Turn WiFi off?\n\nThis dashboard becomes unreachable until the board restarts. " +
+               "LoRa keeps transmitting and the receiver keeps logging, and the receiver's " +
+               "dashboard can still control this board, or reboot it to bring WiFi back.")) return;
   post("/wifi?on=0");
 };
 
@@ -414,6 +482,12 @@ async function pollStatus() {
   $("airtime").textContent = d.airtime_ms.toFixed(0);
   $("duty").textContent = (d.duty_cycle * 100).toFixed(1);
   $("pinMv").textContent = d.pin_mv;
+  $("battV").textContent = (d.batt_mv / 1000).toFixed(2);
+  $("ratio").textContent = d.ratio.toFixed(3);
+  $("chargeSelf").textContent = d.charge;
+  // The receiver reports its charger in every acknowledgement; until one has
+  // arrived there is nothing to show.
+  $("chargePeer").textContent = d.peer_charge === "Unknown" ? "not heard from yet" : d.peer_charge;
 
   baseUptime = d.uptime_s; baseAt = performance.now(); synced = true; tickUptime();
 
@@ -432,7 +506,18 @@ async function pollStatus() {
 
   if (document.activeElement !== $("interval")) $("interval").value = d.interval_ms;
   if (document.activeElement !== $("size")) $("size").value = d.payload_len;
+
+  // Hold the form on the values just submitted until the radio has them. Reloading
+  // at once showed the old profile for up to a packet interval and looked like the
+  // button had failed.
+  if ((awaiting === "apply" && !d.apply_pending) || (awaiting === "push" && !d.push_busy)) {
+    awaiting = null;
+    touched = false;
+  }
   loadForm(d);
+  $("applyLocal").disabled = d.apply_pending;
+  $("applyState").textContent = d.apply_pending
+    ? "Applying here: takes effect once the packet in flight finishes…" : "";
 
   // Disable rather than let a second click collect a 400 "already in flight".
   // A push can take a while: it retries three times, and at a high spreading
@@ -454,7 +539,10 @@ async function pollStatus() {
     ? (d.interval_ms === 0
         ? `Sending <b>back-to-back</b>, next sequence <b>${d.next_seq}</b>.`
         : `Sending every <b>${d.interval_ms} ms</b>, next sequence <b>${d.next_seq}</b>.`)
-    : `Stopped.`;
+    : `Stopped. Checking in with the receiver every <b>${+(pollEveryMs(d) / 1000).toFixed(1)} s</b> ` +
+      `so its dashboard can still reach this board.`;
+  // The receiver's dashboard can drive this board too, over LoRa.
+  $("remoteNote").textContent = d.remote_cmd ? "Last command from the receiver's dashboard: " + d.remote_cmd : "";
 
   loadLog();
 }
@@ -466,6 +554,9 @@ async function loadLog() {
   let d;
   try { d = await (await fetch("/log?since=" + cursor, { cache: "no-store" })).json(); }
   catch (e) { return; }
+  // The board restarted, so its log began again from 0. Asking from the old
+  // cursor skipped the first packets after every reboot; ask again from the top.
+  if (d.next < cursor) { cursor = 0; return loadLog(); }
   if (!d.entries.length && cursor === d.next) return;
   cursor = d.next;
   rows = rows.concat(d.entries).slice(-MAX_ROWS);
