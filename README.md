@@ -1,7 +1,7 @@
 # LoRa range-test and battery-test rig
 
-Two XIAO ESP32C3 boards with Wio-SX1262 radios. One firmware, two roles, each
-serving its own dashboard over WiFi.
+Two Repeater PCBs (ESP32-C3-MINI-1U + Ai-Thinker Ra-01SH SX1262, 865 MHz band).
+One firmware, two roles, each serving its own dashboard over WiFi.
 
 - **Range test** — the sender transmits numbered packets and counts
   acknowledgements; the receiver reports RSSI, SNR, delivery ratio and the rest of
@@ -15,23 +15,36 @@ size) change from the dashboard at runtime and persist to NVS. The sender can pu
 a profile to the receiver over the air, with both ends rolling back automatically
 if the new profile turns out not to work.
 
-## Wiring (XIAO ESP32C3 ↔ Wio-SX1262)
+## Wiring (Repeater PCB: ESP32-C3-MINI-1U ↔ Ra-01SH)
 
-| Signal | XIAO pin | GPIO |
-|---|---|---|
-| MOSI | D10 | 10 |
-| MISO | D9 | 9 |
-| SCK | D8 | 8 |
-| NSS | D4 | 6 |
-| DIO1 | D1 | 3 |
-| RST | D2 | 4 |
-| BUSY | D3 | 5 |
-| RF_SW | D5 | 7 |
-| Battery divider (sender only) | D0 / A0 | 2 |
+| Signal | Ra-01SH pin | ESP32-C3 GPIO | Note |
+|---|---|---|---|
+| MOSI | 14 | 7 | |
+| MISO | 13 | 2 | strapping pin, R4 10k pull-up |
+| SCK | 12 | 6 | |
+| NSS | 15 | 10 | |
+| BUSY | 10 | 1 | |
+| DIO1 | 6 | 20 (U0RXD) | via solder jumper JP5 |
+| RESET | 4 | 21 (U0TXD) | via solder jumper JP6 |
+| DIO2, DIO3, TXEN, RXEN | 7, 8, 5, 11 | — | not connected |
+| Battery divider (sender only) | — | 0 (ADC1_CH0) | R12 100k / R13 30k |
 
-A0/GPIO2 is the only ADC1 pin the radio wiring leaves free — ADC2 is unusable
-while WiFi is active, and GPIO3/GPIO4 are taken by DIO1 and RST. Defaults live in
-`components/sx126x/Kconfig.projbuild`.
+The Ra-01SH has a plain crystal (no TCXO on DIO3), runs from its LDO (no DC-DC
+inductor), and steers its antenna switch internally from DIO2 — so
+`CONFIG_SX126X_TCXO`, `CONFIG_SX126X_DCDC` and `CONFIG_SX126X_RFSW_ENABLE` are all
+off. Defaults live in `components/sx126x/Kconfig.projbuild`.
+
+**UART0 is the radio's.** GPIO20/21 are UART0, so the console runs over the C3's
+native USB (`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG`, set in `sdkconfig.defaults`).
+JP5 must bridge RXD0↔DIO1 and JP6 TXD0↔RESET, not the UART header.
+
+**Battery voltage** is reported as measured at the pin. Multiply by
+(100k + 30k) / 30k = **4.333** for the cell voltage — a full 4.2 V cell reads
+~969 mV at the pin.
+
+**Frequency.** The default carrier is 865.0625 MHz (IN865 channel 1), not
+865.000 MHz: a carrier on the band edge puts half of a 125 kHz signal outside the
+865–867 MHz band. Profiles outside the Ra-01SH's 803–930 MHz are refused.
 
 ## Build
 
@@ -87,7 +100,7 @@ Both: `/` `/status` `/log?since=N` `/radio[?sf=&bw=&cr=&pre=&pwr=&freq=]`
 
 Sender also: `/control?run=&interval_ms=&size=&reset=1` ·
 `/pushcfg?confirm=1&sf=…` · `/mode?m=range|battery` · `/load?on=0|1` ·
-`/divider?value=1.955` · `/divider?reset_uptime=1` · `/wifi?on=0`
+`/uptime?reset=1` · `/wifi?on=0`
 
 Receiver also: `/data.csv` · `/clear?confirm=1` · `/reset`
 
@@ -177,10 +190,12 @@ The discharge clock is checkpointed to NVS, so a reset resumes the run instead o
 forking the receiver's graph, and boot logs the reset reason by name (`BROWNOUT -
 supply sagged`).
 
-**Check RF_SW during bring-up.** Most Wio-SX1262 revisions want that line held
-statically high to power the antenna switch, which is the default. A few use it as
-TX/RX select — `CONFIG_SX126X_RFSW_TX_HIGH` covers those. Getting it wrong looks
-like transmit working at arm's length and nowhere further.
+**Other SX1262 modules.** The driver still supports modules that need a host GPIO
+for the antenna switch (the Seeed Wio-SX1262's RF_SW): enable
+`CONFIG_SX126X_RFSW_ENABLE`, plus `CONFIG_SX126X_RFSW_TX_HIGH` for revisions that
+use it as TX/RX select. That module also wants `CONFIG_SX126X_TCXO` and can use
+`CONFIG_SX126X_DCDC`. Getting the switch wrong looks like transmit working at
+arm's length and nowhere further.
 
 **Turn the power down on the bench.** Side by side at +22 dBm the receiver front
 end saturates: RSSI pins at roughly 0 dBm and SNR sits at the SX126x's ~13 dB
@@ -197,7 +212,7 @@ build defaults and bending the discharge curve for a non-battery reason:
 | Test mode (range / battery) | `radio` | range |
 | Packet interval, payload size | `sender` | Kconfig |
 | Max-drain load | `powerload` | **on** |
-| Divider ratio, discharge clock | `calib` | Kconfig / 0 |
+| Discharge clock | `calib` | 0 |
 
 Max drain defaults to **on** and the mode switch deliberately leaves it alone — it is
 an operator setting, not something a mode change should flip underneath you. A
@@ -206,9 +221,9 @@ commits, so a reset during the provisional window returns to the previous profil
 
 ## Troubleshooting
 
-**`XOSC_START_ERR`, or transmit silently never completing.** This module clocks
-from a TCXO powered by the radio's DIO3 pin, enabled via `CONFIG_SX126X_TCXO`
-(on by default). Without it the failure is genuinely misleading — SPI register
+**`XOSC_START_ERR`, or transmit silently never completing.** The Ra-01SH uses a
+plain crystal, so `CONFIG_SX126X_TCXO` is off; modules that clock from a TCXO
+powered by DIO3 need it on. Getting it wrong is genuinely misleading — SPI register
 reads and writes all succeed because `STDBY_RC` runs off the RC oscillator, every
 configuration command is accepted, and then TX and RX simply never happen because
 both need the XOSC. The symptom is a `TX timeout` with `irq=0x0000`: not even the

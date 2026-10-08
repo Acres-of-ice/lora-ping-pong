@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "sdkconfig.h"
 #include "sx126x.h"
 
 #define LINK_MAGIC       0x524C  // 'LR'
@@ -124,6 +125,16 @@ void link_cfg_from_wire(const link_cfg_wire_t *w, sx126x_cfg_t *out);
 // True when two profiles are identical on the air. Used to skip a redundant
 // reconfigure, which would otherwise re-arm the provisional timer for no reason.
 bool link_cfg_equal(const sx126x_cfg_t *a, const sx126x_cfg_t *b);
+
+// The band the radio module's RF front end is built for. Narrower than the
+// SX1262's own 150-960 MHz: the Ra-01SH is matched for 803-930 MHz.
+#define LINK_FREQ_MIN_HZ ((uint32_t)CONFIG_SX126X_FREQ_MIN_KHZ * 1000u)
+#define LINK_FREQ_MAX_HZ ((uint32_t)CONFIG_SX126X_FREQ_MAX_KHZ * 1000u)
+
+// True when every field of a profile is something this radio can run. Checked on
+// profiles arriving over the air: CRC only proves the frame was not corrupted, not
+// that the sender (or someone else's device on the same sync word) sent sense.
+bool link_cfg_valid(const sx126x_cfg_t *cfg);
 
 // Fill a header in place and return the header size.
 int  link_put_hdr(void *buf, link_pkt_type_t type, uint32_t seq);

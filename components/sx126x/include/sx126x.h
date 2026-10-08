@@ -7,9 +7,11 @@
 // it digests one. Nothing may be sent while BUSY is high, so every transaction in
 // here goes through wait_busy() first.
 //
-// Wiring assumed by the Kconfig defaults (Seeed Wio-SX1262 on a XIAO ESP32C3):
-//   MOSI D10/GPIO10  MISO D9/GPIO9  SCK D8/GPIO8  NSS D4/GPIO6
-//   DIO1 D1/GPIO3    RST  D2/GPIO4  BUSY D3/GPIO5  RF_SW D5/GPIO7
+// Wiring assumed by the Kconfig defaults (Repeater PCB: Ai-Thinker Ra-01SH on an
+// ESP32-C3-MINI-1U):
+//   MOSI GPIO7   MISO GPIO2   SCK GPIO6   NSS GPIO10
+//   DIO1 GPIO20  RST  GPIO21  BUSY GPIO1
+// Crystal (no TCXO), LDO regulator, antenna switch steered internally by DIO2.
 
 #include <stdbool.h>
 #include <stdint.h>

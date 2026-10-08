@@ -1,0 +1,20 @@
+# Shared defaults for both roles. Only read when an sdkconfig is first created -
+# see the README before editing.
+CONFIG_IDF_TARGET="esp32c3"
+
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# The Repeater PCB routes UART0 (GPIO20/21) to the radio's DIO1 and RESET via
+# JP5/JP6, so the console must not use UART0. Logs and flashing go over the
+# ESP32-C3's built-in USB (GPIO18/19).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# The max-drain test wants the worst case: full clock, -O2, 1 kHz tick.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_FREERTOS_HZ=1000
+
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=512

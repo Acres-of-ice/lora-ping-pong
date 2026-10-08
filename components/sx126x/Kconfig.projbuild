@@ -5,95 +5,118 @@ menu "SX1262 Radio"
 		default 33 if IDF_TARGET_ESP32
 		default 46 if IDF_TARGET_ESP32S2
 		default 48 if IDF_TARGET_ESP32S3
-		default 19 if IDF_TARGET_ESP32C3
+		default 21 if IDF_TARGET_ESP32C3
 		default 30 if IDF_TARGET_ESP32C6
 		default 48
 
-	comment "Defaults match a Seeed Wio-SX1262 on a XIAO ESP32C3"
+	comment "Defaults match the Repeater PCB: Ai-Thinker Ra-01SH on an ESP32-C3-MINI-1U"
 
 	config SX126X_MOSI_GPIO
 		int "MOSI GPIO"
 		range 0 SX126X_GPIO_RANGE_MAX
-		default 10
+		default 7
 		help
-			XIAO ESP32C3 D10.
+			Repeater PCB: IO7 (FSPID/MOSI) -> Ra-01SH pin 14.
 
 	config SX126X_MISO_GPIO
 		int "MISO GPIO"
 		range 0 SX126X_GPIO_RANGE_MAX
-		default 9
+		default 2
 		help
-			XIAO ESP32C3 D9. Also a boot strapping pin, but its internal pull-up
-			holds it high while NSS is deasserted, so booting is unaffected.
+			Repeater PCB: IO2 (FSPIQ/MISO) <- Ra-01SH pin 13. IO2 is a boot
+			strapping pin that must read high at reset; R4 (10k to 3V3) holds it
+			there while the radio's MISO is high-impedance.
 
 	config SX126X_SCK_GPIO
 		int "SCK GPIO"
 		range 0 SX126X_GPIO_RANGE_MAX
-		default 8
+		default 6
 		help
-			XIAO ESP32C3 D8.
+			Repeater PCB: IO6 (FSPICLK) -> Ra-01SH pin 12.
 
 	config SX126X_NSS_GPIO
 		int "NSS (chip select) GPIO"
 		range 0 SX126X_GPIO_RANGE_MAX
-		default 6
+		default 10
 		help
-			XIAO ESP32C3 D4.
+			Repeater PCB: IO10 (FSPICS0) -> Ra-01SH pin 15.
 
 	config SX126X_RST_GPIO
 		int "RST GPIO"
 		range 0 SX126X_GPIO_RANGE_MAX
-		default 4
+		default 21
 		help
-			XIAO ESP32C3 D2.
+			Repeater PCB: IO21 (U0TXD) -> JP6 -> Ra-01SH pin 4. This is UART0's TX
+			pin, so the console must not be on UART0 (sdkconfig.defaults moves it
+			to USB-Serial-JTAG). The ROM bootloader still prints on it before the
+			app starts, which just pulses the radio's reset - harmless, since
+			init hard-resets the radio anyway.
 
 	config SX126X_BUSY_GPIO
 		int "BUSY GPIO"
 		range 0 SX126X_GPIO_RANGE_MAX
-		default 5
+		default 1
 		help
-			XIAO ESP32C3 D3. The SX126x holds this high while it is processing a
-			command; the driver waits on it before every SPI transaction. If it
-			never drops, the module is miswired or unpowered.
+			Repeater PCB: IO1 <- Ra-01SH pin 10. The SX126x holds this high while
+			it is processing a command; the driver waits on it before every SPI
+			transaction. If it never drops, the module is miswired or unpowered.
 
 	config SX126X_DIO1_GPIO
 		int "DIO1 (interrupt) GPIO"
 		range 0 SX126X_GPIO_RANGE_MAX
-		default 3
+		default 20
 		help
-			XIAO ESP32C3 D1. Carries TxDone/RxDone/CrcErr/Timeout.
+			Repeater PCB: IO20 (U0RXD) <- JP5 <- Ra-01SH pin 6. Carries
+			TxDone/RxDone/CrcErr/Timeout. UART0's RX pin, so as with RST the
+			console must live on USB-Serial-JTAG.
+
+	config SX126X_RFSW_ENABLE
+		bool "Drive an external RF switch enable line from a GPIO"
+		default n
+		help
+			Only for modules whose antenna switch needs a host GPIO (the Seeed
+			Wio-SX1262's RF_SW pin). The Ra-01SH steers its own switch from DIO2
+			internally and its TXEN/RXEN pins are left unconnected on the Repeater
+			PCB, so leave this off for it.
 
 	config SX126X_RFSW_GPIO
 		int "RF switch enable GPIO"
 		range 0 SX126X_GPIO_RANGE_MAX
 		default 7
-		help
-			XIAO ESP32C3 D5. Powers the module's external antenna switch. TX/RX
-			steering itself is done internally by DIO2.
+		depends on SX126X_RFSW_ENABLE
 
 	config SX126X_RFSW_TX_HIGH
 		bool "Drive RF switch high only during transmit"
 		default n
+		depends on SX126X_RFSW_ENABLE
 		help
 			Most Wio-SX1262 revisions want this line held statically high to power
 			the antenna switch (leave this off). A few instead use it as a TX/RX
 			select. Symptom of getting it wrong: transmit works at arm's length
 			and nowhere beyond.
 
+	config SX126X_DCDC
+		bool "Use the SX1262's DC-DC regulator"
+		default n
+		help
+			The DC-DC needs an external inductor on the module. The Ra-01SH runs
+			from the internal LDO only, so leave this off for it. Turn it on for
+			modules built for DC-DC (e.g. the Wio-SX1262) to save a few mA in RX.
+
 	config SX126X_TCXO
 		bool "Module has a TCXO powered from DIO3"
-		default y
+		default n
 		help
-			The Seeed Wio-SX1262 (and most SX1262 modules) clock from a TCXO whose
-			supply comes from the radio's DIO3 pin. It must be enabled before the
-			crystal oscillator can start.
+			The Ra-01SH clocks from a plain 32 MHz crystal, and its DIO3 is left
+			unconnected on the Repeater PCB, so leave this off for it. Modules
+			such as the Seeed Wio-SX1262 do use a TCXO powered from DIO3 and need
+			this on.
 
-			Leave this on unless you know the module uses a bare crystal. Getting
-			it wrong the other way is deceptive rather than obvious: SPI keeps
-			working because register access runs off the RC oscillator, the chip
-			accepts every configuration command, and then transmit and receive
-			silently never happen because both need the XOSC. The driver now
-			checks GetDeviceErrors for XOSC_START_ERR at boot and says so.
+			Getting it wrong is deceptive rather than obvious: SPI keeps working
+			because register access runs off the RC oscillator, the chip accepts
+			every configuration command, and then transmit and receive silently
+			never happen because both need the XOSC. The driver checks
+			GetDeviceErrors for XOSC_START_ERR at boot and says so.
 
 	config SX126X_TCXO_VOLTAGE
 		int "TCXO supply voltage selector"
@@ -114,6 +137,20 @@ menu "SX1262 Radio"
 			How long the radio waits for the TCXO to stabilise before declaring the
 			oscillator started. 5 ms is a safe default; too short shows up as an
 			intermittent XOSC_START_ERR.
+
+	config SX126X_FREQ_MIN_KHZ
+		int "Lowest frequency the module's RF front end is built for (kHz)"
+		range 150000 960000
+		default 803000
+		help
+			The SX1262 tunes 150-960 MHz, but the module's matching network and
+			antenna do not. The Ra-01SH is specified for 803-930 MHz. Profiles
+			outside this window are refused, from the dashboard and over the air.
+
+	config SX126X_FREQ_MAX_KHZ
+		int "Highest frequency the module's RF front end is built for (kHz)"
+		range 150000 960000
+		default 930000
 
 	choice SX126X_SPI_HOST
 		prompt "SPI peripheral"

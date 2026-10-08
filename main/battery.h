@@ -3,9 +3,8 @@
 #include <stdint.h>
 #include "esp_err.h"
 
-// Battery sensing for the sender. Ported from ESP32Webserver/main/battery.c; the
-// ADC channel default is unchanged because A0/GPIO2 is the only ADC1 pin the
-// SX1262 wiring leaves free.
+// Battery sensing for the sender. Ported from ESP32Webserver/main/battery.c. On the
+// Repeater PCB the BAT+ divider (100k/30k, ratio 4.333) feeds IO0 = ADC1 channel 0.
 
 // Configure ADC1 + calibration. Loads the discharge-cycle clock from NVS.
 esp_err_t battery_init(void);

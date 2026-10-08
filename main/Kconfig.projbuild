@@ -22,14 +22,20 @@ menu "LoRa Test Rig"
 	menu "Radio defaults"
 		comment "Starting values only - the dashboard overrides these and saves to NVS"
 
-		config LINK_FREQ_KHZ
-			int "Carrier frequency (kHz)"
-			range 150000 960000
-			default 866000
+		config LINK_FREQ_HZ
+			int "Carrier frequency (Hz)"
+			range 150000000 960000000
+			default 865062500
 			help
-				866000 sits in the 865-867 MHz Indian ISM band. The SX1262 covers
-				150-960 MHz, but the module's matching network and antenna do not:
-				stay in the band the hardware was built for.
+				865.0625 MHz is the first IN865 channel, the bottom of the 865-867 MHz
+				Indian ISM band. It is deliberately not 865.000 MHz: a carrier there
+				puts half of a 125 kHz signal below the band edge. Keep the carrier
+				at least half the bandwidth inside the band (BW 250 kHz needs
+				865.125 MHz or above).
+
+				The SX1262 covers 150-960 MHz, but the module's matching network and
+				antenna do not: the Ra-01SH is built for 803-930 MHz (see
+				SX126X_FREQ_MIN_KHZ / SX126X_FREQ_MAX_KHZ).
 
 		config LINK_DEFAULT_SF
 			int "Spreading factor"
@@ -191,11 +197,15 @@ menu "LoRa Test Rig"
 		config BATTERY_ADC_CHANNEL
 			int "Battery-sense ADC1 channel"
 			range 0 4
-			default 2
+			default 0
 			help
 				Must be an ADC1 channel: ADC2 is unusable while WiFi is active.
-				With the SX1262 occupying GPIO3 (DIO1) and GPIO4 (RST), channel 2
-				(GPIO2 = A0/D0) is the only one the XIAO ESP32C3 header leaves free.
+				On the Repeater PCB the BAT+ divider (R12 100k over R13 30k, C11
+				100nF) feeds IO0, which is ADC1 channel 0.
+
+				The firmware reports the voltage at the pin; the battery voltage is
+				that times (100k + 30k) / 30k = 4.333. A full 4.2 V cell reads about
+				969 mV at the pin.
 
 		config LOG_INTERVAL_S
 			int "Discharge-clock checkpoint interval (seconds)"

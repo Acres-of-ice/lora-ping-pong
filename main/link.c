@@ -88,6 +88,23 @@ bool link_cfg_equal(const sx126x_cfg_t *a, const sx126x_cfg_t *b)
            a->sync_word == b->sync_word && a->crc_on   == b->crc_on;
 }
 
+bool link_cfg_valid(const sx126x_cfg_t *cfg)
+{
+    bool bw_ok = false;
+    for (int i = 0; i < LINK_BW_COUNT; i++) {
+        if (LINK_BW_CODE[i] == cfg->bw) {
+            bw_ok = true;
+            break;
+        }
+    }
+    return bw_ok &&
+           cfg->freq_hz >= LINK_FREQ_MIN_HZ && cfg->freq_hz <= LINK_FREQ_MAX_HZ &&
+           cfg->sf >= 5 && cfg->sf <= 12 &&
+           cfg->cr >= 5 && cfg->cr <= 8 &&
+           cfg->preamble >= 6 &&
+           cfg->tx_dbm >= -9 && cfg->tx_dbm <= 22;
+}
+
 int link_put_hdr(void *buf, link_pkt_type_t type, uint32_t seq)
 {
     link_hdr_t *h = (link_hdr_t *)buf;
@@ -162,7 +179,7 @@ esp_err_t link_init(void)
     }
 
     s_cfg = (sx126x_cfg_t){
-        .freq_hz   = (uint32_t)CONFIG_LINK_FREQ_KHZ * 1000u,
+        .freq_hz   = (uint32_t)CONFIG_LINK_FREQ_HZ,
         .sf        = CONFIG_LINK_DEFAULT_SF,
         .bw        = SX126X_BW_125000,
         .cr        = CONFIG_LINK_DEFAULT_CR,

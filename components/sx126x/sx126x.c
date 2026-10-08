@@ -62,7 +62,15 @@ static const char *TAG = "sx126x";
 
 #define STDBY_RC        0x00
 #define PACKET_TYPE_LORA 0x01
+#define REGULATOR_LDO   0x00
 #define REGULATOR_DCDC  0x01
+#if CONFIG_SX126X_DCDC
+#define REGULATOR_MODE  REGULATOR_DCDC
+#define REGULATOR_NAME  "DC-DC"
+#else
+#define REGULATOR_MODE  REGULATOR_LDO
+#define REGULATOR_NAME  "LDO"
+#endif
 #define RAMP_200U       0x04
 #define LORA_HEADER_EXPLICIT 0x00
 
@@ -83,6 +91,19 @@ static const char *TAG = "sx126x";
 // SetRx/SetTx timeouts count in 15.625 us steps, so 1 ms = 64 steps.
 #define RTC_STEPS_PER_MS  64
 #define RX_CONTINUOUS     0xFFFFFF
+// Largest finite timeout the 24-bit field can hold (~262 s). 0xFFFFFF itself
+// means "continuous" for RX, so finite timeouts stop one short of it.
+#define TIMEOUT_MAX_STEPS 0xFFFFFE
+
+// Convert a millisecond timeout to SetTx/SetRx steps, saturating rather than
+// wrapping. A full-size packet at SF12/BW7.8kHz is ~145 s, and the callers'
+// 2x-airtime budget for it overflowed 24 bits - the truncated value was a few
+// seconds, so the chip aborted the packet with a timeout mid-air.
+static uint32_t timeout_steps(uint32_t timeout_ms)
+{
+    const uint64_t steps = (uint64_t)timeout_ms * RTC_STEPS_PER_MS;
+    return steps > TIMEOUT_MAX_STEPS ? TIMEOUT_MAX_STEPS : (uint32_t)steps;
+}
 
 // The chip accepts SPI up to 16 MHz; 8 MHz is comfortable over jumper wiring.
 #define SPI_CLOCK_HZ  8000000
@@ -330,10 +351,13 @@ static void log_diagnostics(const char *what)
 
 // The external antenna switch on the Wio-SX1262 needs powering separately from
 // DIO2's internal TX/RX steering. Some module revisions instead want this line
-// driven high only during transmit, hence the Kconfig option.
+// driven high only during transmit, hence the Kconfig option. Modules like the
+// Ra-01SH need nothing from the host here: DIO2 alone steers their switch.
 static void rf_switch(bool transmitting)
 {
-#if CONFIG_SX126X_RFSW_TX_HIGH
+#if !CONFIG_SX126X_RFSW_ENABLE
+    (void)transmitting;
+#elif CONFIG_SX126X_RFSW_TX_HIGH
     gpio_set_level(CONFIG_SX126X_RFSW_GPIO, transmitting ? 1 : 0);
 #else
     (void)transmitting;
@@ -445,15 +469,17 @@ static esp_err_t chip_bringup(void)
 
     BAIL(set_standby());
 
-    const uint8_t reg_mode = REGULATOR_DCDC;
+    // DC-DC only where the module fits the inductor for it; the Ra-01SH does not.
+    const uint8_t reg_mode = REGULATOR_MODE;
     BAIL(cmd(CMD_SET_REGULATOR_MODE, &reg_mode, 1));
 
-    // DIO2 drives the module's internal TX/RX steering.
+    // DIO2 drives the module's internal TX/RX steering (on the Ra-01SH it is
+    // wired to the antenna switch inside the module, hence unconnected outside).
     const uint8_t dio2_rf = 0x01;
     BAIL(cmd(CMD_SET_DIO2_AS_RF_SWITCH, &dio2_rf, 1));
 
 #if CONFIG_SX126X_TCXO
-    // The Wio-SX1262 clocks from a TCXO that DIO3 powers. Without this the XOSC
+    // Modules like the Wio-SX1262 clock from a TCXO that DIO3 powers. Without this the XOSC
     // never starts, and the failure is deceptive: every SPI command still works
     // (STDBY_RC runs off the RC oscillator) but TX and RX silently never happen.
     // The delay is how long the chip waits for the TCXO to settle, in 15.625 us
@@ -548,10 +574,13 @@ static esp_err_t chip_bringup(void)
     }
 
     s_ready = true;
-    ESP_LOGI(TAG, "SX1262 up: NSS=%d SCK=%d MOSI=%d MISO=%d RST=%d BUSY=%d DIO1=%d RFSW=%d",
+    ESP_LOGI(TAG, "SX1262 up: NSS=%d SCK=%d MOSI=%d MISO=%d RST=%d BUSY=%d DIO1=%d, %s regulator",
              CONFIG_SX126X_NSS_GPIO, CONFIG_SX126X_SCK_GPIO, CONFIG_SX126X_MOSI_GPIO,
              CONFIG_SX126X_MISO_GPIO, CONFIG_SX126X_RST_GPIO, CONFIG_SX126X_BUSY_GPIO,
-             CONFIG_SX126X_DIO1_GPIO, CONFIG_SX126X_RFSW_GPIO);
+             CONFIG_SX126X_DIO1_GPIO, REGULATOR_NAME);
+#if CONFIG_SX126X_RFSW_ENABLE
+    ESP_LOGI(TAG, "RF switch enable on GPIO%d", CONFIG_SX126X_RFSW_GPIO);
+#endif
     return ESP_OK;
 }
 
@@ -564,7 +593,11 @@ esp_err_t sx126x_init(void)
     }
 
     const gpio_config_t out_cfg = {
-        .pin_bit_mask = (1ULL << CONFIG_SX126X_RST_GPIO) | (1ULL << CONFIG_SX126X_RFSW_GPIO),
+        .pin_bit_mask = (1ULL << CONFIG_SX126X_RST_GPIO)
+#if CONFIG_SX126X_RFSW_ENABLE
+                        | (1ULL << CONFIG_SX126X_RFSW_GPIO)
+#endif
+                        ,
         .mode         = GPIO_MODE_OUTPUT,
     };
     ESP_ERROR_CHECK(gpio_config(&out_cfg));
@@ -766,7 +799,7 @@ esp_err_t sx126x_tx(const uint8_t *buf, uint8_t len, uint32_t timeout_ms)
 
     rf_switch(true);
 
-    const uint32_t steps = timeout_ms * RTC_STEPS_PER_MS;
+    const uint32_t steps = timeout_steps(timeout_ms);
     const uint8_t p[3] = { (uint8_t)(steps >> 16), (uint8_t)(steps >> 8), (uint8_t)steps };
     const esp_err_t tx_err = cmd(CMD_SET_TX, p, sizeof(p));
     if (tx_err != ESP_OK) {
@@ -811,7 +844,7 @@ esp_err_t sx126x_rx_start(uint32_t timeout_ms)
 
     rf_switch(false);
 
-    const uint32_t steps = (timeout_ms == 0) ? RX_CONTINUOUS : (timeout_ms * RTC_STEPS_PER_MS);
+    const uint32_t steps = (timeout_ms == 0) ? RX_CONTINUOUS : timeout_steps(timeout_ms);
     const uint8_t p[3] = { (uint8_t)(steps >> 16), (uint8_t)(steps >> 8), (uint8_t)steps };
     esp_err_t err = cmd(CMD_SET_RX, p, sizeof(p));
     unlock();

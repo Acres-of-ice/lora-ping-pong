@@ -124,7 +124,10 @@ static bool cfg_from_query(const char *query, sx126x_cfg_t *cfg, const char **er
         cfg->tx_dbm = (int8_t)v;
     }
     if (q_long(query, "freq", &v)) {
-        if (v < 150000000L || v > 960000000L) { *err = "frequency out of SX1262 range"; return false; }
+        if (v < (long)LINK_FREQ_MIN_HZ || v > (long)LINK_FREQ_MAX_HZ) {
+            *err = "frequency outside the radio module's band";
+            return false;
+        }
         cfg->freq_hz = (uint32_t)v;
     }
     if (q_long(query, "crc", &v)) {

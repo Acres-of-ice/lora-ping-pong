@@ -122,6 +122,14 @@ static void handle_cfg(const uint8_t *rx, int n)
     sx126x_cfg_t old, want;
     link_get_cfg(&old);
     link_cfg_from_wire(&p->cfg, &want);
+    if (!link_cfg_valid(&want)) {
+        // Not acknowledged: the sender applies provisionally either way, finds
+        // no traffic, and reverts - which is the right outcome for a bad profile.
+        ESP_LOGE(TAG, "Ignoring pushed profile outside what this radio supports "
+                      "(%lu Hz SF%u CR4/%u %+d dBm)",
+                 (unsigned long)want.freq_hz, want.sf, want.cr, want.tx_dbm);
+        return;
+    }
 
     uint8_t ack[sizeof(link_hdr_t)];
     link_put_hdr(ack, PKT_CFGACK, p->hdr.seq);
